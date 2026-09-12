@@ -1578,6 +1578,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "http-body 1.1.0",
+ "httpdate",
  "rustc-hash",
  "serde",
  "thiserror",

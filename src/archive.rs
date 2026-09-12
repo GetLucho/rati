@@ -500,6 +500,11 @@ async fn read_s3_range(
     Ok(data)
 }
 
+/// Format a `SystemTime` as an HTTP-date (RFC 9110 IMF-fixdate).
+fn format_http_date(t: std::time::SystemTime) -> String {
+    httpdate::fmt_http_date(t)
+}
+
 /// Open the archive from the local filesystem. ETag is synthesized from `mtime+size`
 /// (matches a fresh value whenever the archive changes); Last-Modified is the file's
 /// mtime formatted as an HTTP-date.
@@ -518,10 +523,7 @@ fn open_local(path: &str) -> Result<(Storage, Box<str>, Box<str>, u64), Error> {
         .map_err(|_| Error::Protocol("file mtime is before UNIX epoch".into()))?
         .as_secs();
     let etag: Box<str> = format!("\"{mtime_unix}-{archive_size}\"").into();
-    let last_modified: Box<str> = aws_sdk_s3::primitives::DateTime::from(mtime)
-        .fmt(aws_sdk_s3::primitives::DateTimeFormat::HttpDate)
-        .map_err(|e| Error::Protocol(format!("format mtime as HttpDate: {e}")))?
-        .into();
+    let last_modified: Box<str> = format_http_date(mtime).into();
     let file =
         std::fs::File::open(path).map_err(|e| Error::Io(format!("open({path}) failed: {e}")))?;
 
@@ -1059,5 +1061,11 @@ mod tests {
         assert_eq!(parse_s3_url("s3:/bad-url/format"), None);
         assert_eq!(parse_s3_url("s3://bucket-only"), None);
         assert_eq!(parse_s3_url("s3://file-only.tar"), None);
+    }
+
+    #[test]
+    fn http_date_format_matches_imf_fixdate() {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_744_891_200);
+        assert_eq!(format_http_date(t), "Thu, 17 Apr 2025 12:00:00 GMT");
     }
 }
