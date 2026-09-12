@@ -7,7 +7,7 @@ use azure_core::http::Url;
 use azure_core::http::headers::HeaderName;
 use azure_identity::{
     DeveloperToolsCredential, ManagedIdentityCredential, ManagedIdentityCredentialOptions,
-    UserAssignedId,
+    UserAssignedId, WorkloadIdentityCredential,
 };
 use azure_storage_blob::BlobClient;
 use azure_storage_blob::models::{BlobClientDownloadOptions, HttpRange};
@@ -80,30 +80,84 @@ pub(super) fn has_sas_token(url: &str) -> bool {
 }
 
 /// Which credential rati should present to Azure Blob.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum CredentialKind {
-    /// The URL carries a SAS; no credential needed.
+///
+/// `azure_identity` 1.0 ships no `DefaultAzureCredential`, so rati selects one
+/// explicitly rather than chaining and probing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum CredentialKind {
+    /// No credential: a SAS in the URL, a public container, or a plaintext endpoint.
     Anonymous,
-    /// Running on Azure — Container Apps, App Service, or a VM.
+    /// Entra Workload ID — an AKS pod with a projected federated token.
+    WorkloadIdentity,
+    /// A managed identity: Container Apps, App Service, Arc, Cloud Shell, or IMDS
+    /// on a plain VM or VMSS.
     ManagedIdentity,
     /// Local development; chains the az and azd CLIs.
     DeveloperTools,
 }
 
-/// Pick a credential from the URL and the ambient environment.
+/// The environment markers that identify where rati is running.
 ///
-/// Azure Container Apps injects `IDENTITY_ENDPOINT` (with `IDENTITY_HEADER`) for
-/// both system- and user-assigned identities, which is what `azure_identity`'s
-/// App Service source reads.
-pub(super) fn select_credential_kind(url: &str, identity_endpoint: Option<&str>) -> CredentialKind {
-    // A bearer token must never go out over plaintext, so an http endpoint is
-    // anonymous whatever the environment says. The SDK enforces this too, but it
-    // reports it as an opaque client-construction failure.
-    let insecure = Url::parse(url).is_ok_and(|u| u.scheme() != "https");
+/// Captured as a struct so the selection below is a pure function and can be
+/// tested without mutating process-wide environment state.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct CredentialEnv<'a> {
+    /// Set by Container Apps, App Service and Azure Arc.
+    pub identity_endpoint: Option<&'a str>,
+    /// Set by Cloud Shell and Azure ML.
+    pub msi_endpoint: Option<&'a str>,
+    /// Set by the AKS workload-identity webhook.
+    pub federated_token_file: Option<&'a str>,
+}
 
+impl CredentialEnv<'static> {
+    /// Read the markers from the process environment.
+    fn from_process() -> Self {
+        fn var(key: &str) -> Option<&'static str> {
+            // Leaked so the struct can borrow for 'static; there are at most three
+            // of these and they live as long as the process anyway.
+            std::env::var(key)
+                .ok()
+                .filter(|v| !v.is_empty())
+                .map(|v| &*Box::leak(v.into_boxed_str()))
+        }
+        Self {
+            identity_endpoint: var("IDENTITY_ENDPOINT"),
+            msi_endpoint: var("MSI_ENDPOINT"),
+            federated_token_file: var("AZURE_FEDERATED_TOKEN_FILE"),
+        }
+    }
+}
+
+/// Pick a credential from the URL, the ambient environment, and an optional
+/// explicit override.
+///
+/// Detection order matters. A federated token file outranks the managed-identity
+/// markers because an AKS pod can carry both, and only the projected token works.
+/// A plain Azure VM or VMSS exposes *no* marker — IMDS is reachable but invisible —
+/// so that case must be requested by name via `override_kind`.
+pub(super) fn select_credential_kind(
+    url: &str,
+    env: &CredentialEnv<'_>,
+    override_kind: Option<CredentialKind>,
+) -> CredentialKind {
+    // A bearer token must never go out over plaintext, so an http endpoint is
+    // anonymous whatever the environment or the operator says. The SDK rejects the
+    // combination too, but reports it as an opaque client-construction failure.
+    let insecure = Url::parse(url).is_ok_and(|u| u.scheme() != "https");
     if insecure || has_sas_token(url) {
-        CredentialKind::Anonymous
-    } else if identity_endpoint.is_some_and(|e| !e.is_empty()) {
+        return CredentialKind::Anonymous;
+    }
+
+    if let Some(kind) = override_kind {
+        return kind;
+    }
+
+    let set = |v: Option<&str>| v.is_some_and(|s| !s.is_empty());
+
+    if set(env.federated_token_file) {
+        CredentialKind::WorkloadIdentity
+    } else if set(env.identity_endpoint) || set(env.msi_endpoint) {
         CredentialKind::ManagedIdentity
     } else {
         CredentialKind::DeveloperTools
@@ -124,14 +178,42 @@ pub(super) fn parse_content_range_total(header: &str) -> Option<u64> {
         .ok()
 }
 
+/// A nudge toward the usual cause when a given credential cannot get a token.
+fn credential_hint(kind: CredentialKind) -> &'static str {
+    match kind {
+        CredentialKind::Anonymous => {
+            " (no credential was used: the URL has no SAS, or the endpoint is plaintext \
+             — the container must allow anonymous read)"
+        }
+        CredentialKind::ManagedIdentity => {
+            " (IMDS is only reachable from Azure-hosted compute; off Azure, use \
+             --azure-credential developer-tools and `az login`)"
+        }
+        CredentialKind::WorkloadIdentity => {
+            " (AZURE_FEDERATED_TOKEN_FILE is set but the projected token was rejected; \
+             check the federated credential and that the identity has Storage Blob Data Reader)"
+        }
+        CredentialKind::DeveloperTools => " (try `az login`)",
+    }
+}
+
 /// Build the credential rati presents to Azure Blob for `url`.
 fn build_credential(
     url: &str,
     user_assigned_id: Option<&str>,
+    override_kind: Option<CredentialKind>,
 ) -> Result<Option<Arc<dyn TokenCredential>>, Error> {
-    let identity_endpoint = std::env::var("IDENTITY_ENDPOINT").ok();
-    match select_credential_kind(url, identity_endpoint.as_deref()) {
+    let env = CredentialEnv::from_process();
+    let kind = select_credential_kind(url, &env, override_kind);
+    tracing::info!("Azure credential: {kind:?}");
+
+    match kind {
         CredentialKind::Anonymous => Ok(None),
+        CredentialKind::WorkloadIdentity => {
+            let credential = WorkloadIdentityCredential::new(None)
+                .map_err(|e| Error::Io(format!("workload identity credential: {e}")))?;
+            Ok(Some(credential))
+        }
         CredentialKind::ManagedIdentity => {
             let options = user_assigned_id.map(|id| ManagedIdentityCredentialOptions {
                 user_assigned_id: Some(UserAssignedId::ClientId(id.to_string())),
@@ -157,10 +239,12 @@ fn build_credential(
 pub(super) async fn open_azure(
     url: &str,
     user_assigned_id: Option<&str>,
+    override_kind: Option<CredentialKind>,
 ) -> Result<(Storage, ArchiveSource), Error> {
     let parsed =
         Url::parse(url).map_err(|e| Error::Protocol(format!("invalid blob URL {url}: {e}")))?;
-    let credential = build_credential(url, user_assigned_id)?;
+    let kind = select_credential_kind(url, &CredentialEnv::from_process(), override_kind);
+    let credential = build_credential(url, user_assigned_id, override_kind)?;
 
     let client = BlobClient::new(parsed, credential, None)
         .map_err(|e| Error::Io(format!("creating blob client: {e}")))?;
@@ -171,7 +255,15 @@ pub(super) async fn open_azure(
             ..Default::default()
         }))
         .await
-        .map_err(|e| Error::Io(format!("blob metadata probe failed: {e}")))?;
+        .map_err(|e| {
+            // The credential is only exercised on the first request, so an auth
+            // failure surfaces here rather than at construction. Name the credential
+            // that was tried — the SDK's own message does not.
+            Error::Io(format!(
+                "reading {url} failed using the {kind:?} credential: {e}{}",
+                credential_hint(kind)
+            ))
+        })?;
 
     let etag: Box<str> = probe
         .properties
@@ -286,36 +378,128 @@ mod tests {
         ));
     }
 
+    const PLAIN: &str = "https://acct.blob.core.windows.net/t/p.tar";
+    const SAS: &str = "https://acct.blob.core.windows.net/t/p.tar?sv=1&sig=abc";
+    const INSECURE: &str = "http://127.0.0.1:10000/devstoreaccount1/c/p.tar";
+
+    /// An environment with no Azure markers at all — a developer laptop.
+    fn bare() -> CredentialEnv<'static> {
+        CredentialEnv::default()
+    }
+
     #[test]
-    fn select_credential_kind_test() {
+    fn sas_and_plaintext_need_no_credential() {
         use CredentialKind::*;
 
-        let plain = "https://acct.blob.core.windows.net/t/p.tar";
-        let sas = "https://acct.blob.core.windows.net/t/p.tar?sv=1&sig=abc";
-
         // A SAS in the URL authenticates the request on its own.
-        assert_eq!(select_credential_kind(sas, None), Anonymous);
+        assert_eq!(select_credential_kind(SAS, &bare(), None), Anonymous);
         assert_eq!(
-            select_credential_kind(sas, Some("http://169.254.0.1/token")),
+            select_credential_kind(SAS, &container_apps(), None),
             Anonymous
         );
 
-        // Container Apps injects IDENTITY_ENDPOINT.
+        // Never put a bearer token on the wire in the clear, whatever the
+        // environment says and even when explicitly asked to.
+        assert_eq!(select_credential_kind(INSECURE, &bare(), None), Anonymous);
         assert_eq!(
-            select_credential_kind(plain, Some("http://169.254.0.1/token")),
+            select_credential_kind(INSECURE, &container_apps(), None),
+            Anonymous
+        );
+        assert_eq!(
+            select_credential_kind(INSECURE, &bare(), Some(CredentialKind::ManagedIdentity)),
+            Anonymous
+        );
+    }
+
+    /// Azure Container Apps and App Service both inject these.
+    fn container_apps() -> CredentialEnv<'static> {
+        CredentialEnv {
+            identity_endpoint: Some("http://169.254.255.2:8081/msi/token"),
+            ..Default::default()
+        }
+    }
+
+    /// An AKS pod with the workload-identity webhook.
+    fn aks_workload() -> CredentialEnv<'static> {
+        CredentialEnv {
+            federated_token_file: Some("/var/run/secrets/azure/tokens/azure-identity-token"),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn azure_hosted_environments_use_managed_identity() {
+        use CredentialKind::*;
+
+        // Container Apps: the primary deployment target.
+        assert_eq!(
+            select_credential_kind(PLAIN, &container_apps(), None),
             ManagedIdentity
         );
 
-        // Local development falls back to the az CLI.
-        assert_eq!(select_credential_kind(plain, None), DeveloperTools);
-        assert_eq!(select_credential_kind(plain, Some("")), DeveloperTools);
+        // Cloud Shell / Azure ML expose MSI_ENDPOINT instead.
+        let msi = CredentialEnv {
+            msi_endpoint: Some("http://localhost:50342/oauth2/token"),
+            ..Default::default()
+        };
+        assert_eq!(select_credential_kind(PLAIN, &msi, None), ManagedIdentity);
+    }
 
-        // Never put a bearer token on the wire in the clear: plaintext endpoints
-        // (Azurite, a local proxy) are anonymous regardless of the environment.
-        let insecure = "http://127.0.0.1:10000/devstoreaccount1/c/p.tar";
-        assert_eq!(select_credential_kind(insecure, None), Anonymous);
+    #[test]
+    fn aks_pods_use_workload_identity() {
+        // A federated token file outranks the managed-identity sources: an AKS pod
+        // may have both, and the projected token is the one that works.
         assert_eq!(
-            select_credential_kind(insecure, Some("http://169.254.0.1/token")),
+            select_credential_kind(PLAIN, &aks_workload(), None),
+            CredentialKind::WorkloadIdentity
+        );
+
+        let both = CredentialEnv {
+            federated_token_file: aks_workload().federated_token_file,
+            identity_endpoint: container_apps().identity_endpoint,
+            ..Default::default()
+        };
+        assert_eq!(
+            select_credential_kind(PLAIN, &both, None),
+            CredentialKind::WorkloadIdentity
+        );
+    }
+
+    #[test]
+    fn bare_environment_falls_back_to_the_cli() {
+        assert_eq!(
+            select_credential_kind(PLAIN, &bare(), None),
+            CredentialKind::DeveloperTools
+        );
+        // Empty markers are not markers.
+        let empty = CredentialEnv {
+            identity_endpoint: Some(""),
+            msi_endpoint: Some(""),
+            federated_token_file: Some(""),
+        };
+        assert_eq!(
+            select_credential_kind(PLAIN, &empty, None),
+            CredentialKind::DeveloperTools
+        );
+    }
+
+    #[test]
+    fn explicit_override_wins_over_detection() {
+        use CredentialKind::*;
+
+        // A bare Azure VM or VMSS exposes no environment marker at all, so IMDS
+        // has to be asked for by name.
+        assert_eq!(
+            select_credential_kind(PLAIN, &bare(), Some(ManagedIdentity)),
+            ManagedIdentity
+        );
+        // ...and detection can be overridden the other way too.
+        assert_eq!(
+            select_credential_kind(PLAIN, &container_apps(), Some(DeveloperTools)),
+            DeveloperTools
+        );
+        assert_eq!(
+            select_credential_kind(PLAIN, &container_apps(), Some(Anonymous)),
             Anonymous
         );
     }

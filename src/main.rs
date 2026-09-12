@@ -42,8 +42,32 @@ struct Config {
     #[arg(long, default_value_t = NonZero::new(4).unwrap())]
     concurrency: NonZero<u16>,
     /// Client ID of a user-assigned managed identity for Azure Blob archives
-    #[arg(long, env = "AZURE_CLIENT_ID")]
+    ///
+    /// Deliberately not bound to AZURE_CLIENT_ID: the Azure SDK reads that
+    /// variable itself for workload identity and service-principal auth, so
+    /// adopting it here would hijack an already-meaningful setting.
+    #[cfg(feature = "azure")]
+    #[arg(long, env = "RATI_AZURE_USER_ASSIGNED_ID", value_parser = non_empty)]
     azure_user_assigned_id: Option<String>,
+    /// Force an Azure credential instead of detecting one from the environment.
+    ///
+    /// A plain Azure VM or VMSS exposes no environment marker, so reaching IMDS
+    /// there needs `managed-identity` named explicitly.
+    #[cfg(feature = "azure")]
+    #[arg(long, value_enum)]
+    azure_credential: Option<storage::CredentialKind>,
+}
+
+/// Reject an empty string from the environment: `RATI_AZURE_USER_ASSIGNED_ID=""`
+/// would otherwise become `Some("")` and request a token with an empty client id,
+/// which Azure answers with an opaque 400.
+#[cfg(feature = "azure")]
+fn non_empty(s: &str) -> Result<String, String> {
+    if s.trim().is_empty() {
+        Err("must not be empty".into())
+    } else {
+        Ok(s.to_string())
+    }
 }
 
 #[derive(Clone)]
@@ -76,7 +100,14 @@ async fn run(config: Config) {
         &config.archive,
         config.scan_index,
         config.dataset_id.as_deref(),
-        config.azure_user_assigned_id.as_deref(),
+        storage::AzureOptions {
+            #[cfg(feature = "azure")]
+            user_assigned_id: config.azure_user_assigned_id.as_deref(),
+            #[cfg(feature = "azure")]
+            credential: config.azure_credential,
+            #[cfg(not(feature = "azure"))]
+            _unused: std::marker::PhantomData,
+        },
     )
     .await
     .expect("failed to load tar index");

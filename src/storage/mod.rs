@@ -5,6 +5,9 @@
 
 #[cfg(feature = "azure")]
 mod azure;
+
+#[cfg(feature = "azure")]
+pub use azure::CredentialKind;
 mod local;
 #[cfg(feature = "s3")]
 mod s3;
@@ -14,6 +17,20 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::archive::Error;
+
+/// Azure-specific knobs, threaded through from the command line. Inert for the
+/// other backends, and for every backend when the `azure` feature is off.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AzureOptions<'a> {
+    /// Client ID of a user-assigned managed identity.
+    #[cfg(feature = "azure")]
+    pub user_assigned_id: Option<&'a str>,
+    /// Force a credential instead of detecting one from the environment.
+    #[cfg(feature = "azure")]
+    pub credential: Option<azure::CredentialKind>,
+    #[cfg(not(feature = "azure"))]
+    pub _unused: std::marker::PhantomData<&'a ()>,
+}
 
 /// Source metadata read once when the archive is opened.
 pub struct ArchiveSource {
@@ -47,11 +64,11 @@ impl Storage {
     /// Open `source`: an S3 URL (`s3://bucket/key`) or a local filesystem path.
     pub async fn open(
         source: &str,
-        #[allow(unused_variables)] azure_user_assigned_id: Option<&str>,
+        #[allow(unused_variables)] opts: AzureOptions<'_>,
     ) -> Result<(Self, ArchiveSource), Error> {
         #[cfg(feature = "azure")]
         if azure::is_azure_url(source) {
-            return azure::open_azure(source, azure_user_assigned_id).await;
+            return azure::open_azure(source, opts.user_assigned_id, opts.credential).await;
         }
 
         #[cfg(feature = "azure")]
