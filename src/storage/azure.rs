@@ -30,21 +30,43 @@ const BLOB_HOST_SUFFIXES: [&str; 4] = [
     ".blob.core.cloudapi.de",
 ];
 
-/// True when `source` is an HTTPS URL pointing at an Azure Blob endpoint.
+/// Azurite and the legacy emulator both serve this well-known development account.
+const EMULATOR_ACCOUNT: &str = "devstoreaccount1";
+
+/// True when `source` is an HTTP(S) URL pointing at an Azure Blob endpoint.
+///
+/// `http` counts: routing an insecure blob URL here lets [`open_azure`] reject or
+/// downgrade it deliberately, rather than letting it fall through and be `stat()`ed
+/// as a local filesystem path.
 pub(super) fn is_azure_url(source: &str) -> bool {
-    let Some(rest) = source.strip_prefix("https://") else {
+    let Ok(url) = Url::parse(source) else {
         return false;
     };
-    let host = rest
-        .split(['/', '?'])
-        .next()
-        .unwrap_or_default()
-        .split('@')
-        .next_back()
-        .unwrap_or_default();
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    // `Url` lowercases the host during parsing; hostnames are case-insensitive.
+    let Some(host) = url.host_str() else {
+        return false;
+    };
     BLOB_HOST_SUFFIXES
         .iter()
         .any(|suffix| host.len() > suffix.len() && host.ends_with(suffix))
+        || is_emulator_url(source)
+}
+
+/// True when the URL addresses the storage emulator's well-known account, which is
+/// how Azurite is reached (`http://127.0.0.1:10000/devstoreaccount1/...`).
+pub(super) fn is_emulator_url(source: &str) -> bool {
+    let Ok(url) = Url::parse(source) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    url.path_segments()
+        .and_then(|mut segments| segments.next())
+        .is_some_and(|account| account == EMULATOR_ACCOUNT)
 }
 
 /// True when the URL carries a shared access signature, meaning no credential is needed.
@@ -74,7 +96,12 @@ pub(super) enum CredentialKind {
 /// both system- and user-assigned identities, which is what `azure_identity`'s
 /// App Service source reads.
 pub(super) fn select_credential_kind(url: &str, identity_endpoint: Option<&str>) -> CredentialKind {
-    if has_sas_token(url) {
+    // A bearer token must never go out over plaintext, so an http endpoint is
+    // anonymous whatever the environment says. The SDK enforces this too, but it
+    // reports it as an opaque client-construction failure.
+    let insecure = Url::parse(url).is_ok_and(|u| u.scheme() != "https");
+
+    if insecure || has_sas_token(url) {
         CredentialKind::Anonymous
     } else if identity_endpoint.is_some_and(|e| !e.is_empty()) {
         CredentialKind::ManagedIdentity
@@ -216,6 +243,20 @@ mod tests {
             "https://acct.blob.core.windows.net/tiles/planet.tar?sv=2024-11-04&sig=abc"
         ));
 
+        // DNS hostnames are case-insensitive
+        assert!(is_azure_url(
+            "https://acct.Blob.Core.Windows.Net/tiles/planet.tar"
+        ));
+        // explicit port, and a fragment, must not defeat the match
+        assert!(is_azure_url(
+            "https://acct.blob.core.windows.net:443/tiles/planet.tar"
+        ));
+        // http against a real blob host is still a blob endpoint; routing it here
+        // lets us reject it loudly instead of stat()-ing it as a local path
+        assert!(is_azure_url(
+            "http://acct.blob.core.windows.net/tiles/planet.tar"
+        ));
+
         assert!(!is_azure_url("s3://bucket/planet.tar"));
         assert!(!is_azure_url("./planet.tar"));
         assert!(!is_azure_url("/data/planet.tar"));
@@ -268,6 +309,32 @@ mod tests {
         // Local development falls back to the az CLI.
         assert_eq!(select_credential_kind(plain, None), DeveloperTools);
         assert_eq!(select_credential_kind(plain, Some("")), DeveloperTools);
+
+        // Never put a bearer token on the wire in the clear: plaintext endpoints
+        // (Azurite, a local proxy) are anonymous regardless of the environment.
+        let insecure = "http://127.0.0.1:10000/devstoreaccount1/c/p.tar";
+        assert_eq!(select_credential_kind(insecure, None), Anonymous);
+        assert_eq!(
+            select_credential_kind(insecure, Some("http://169.254.0.1/token")),
+            Anonymous
+        );
+    }
+
+    #[test]
+    fn is_emulator_url_test() {
+        // Azurite's well-known development account, however it is addressed.
+        assert!(is_emulator_url(
+            "http://127.0.0.1:10000/devstoreaccount1/valhalla/tiles.tar"
+        ));
+        assert!(is_emulator_url(
+            "http://azurite:10000/devstoreaccount1/valhalla/tiles.tar"
+        ));
+
+        assert!(!is_emulator_url(
+            "https://acct.blob.core.windows.net/devstoreaccount1x/t.tar"
+        ));
+        assert!(!is_emulator_url("http://127.0.0.1:10000/other/c/p.tar"));
+        assert!(!is_emulator_url("/data/planet.tar"));
     }
 
     #[test]

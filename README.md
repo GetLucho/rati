@@ -72,8 +72,21 @@ az role assignment create \
   --scope "/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Storage/storageAccounts/<account>"
 ```
 
-Do not set `Content-Encoding` on the archive blob: the SDK's HTTP client negotiates gzip
-transparently, and a blob-level encoding would corrupt range offsets.
+### Testing against Azurite
+
+The emulator's well-known development account is recognised, so a local Azurite instance
+works without configuration:
+
+```sh
+azurite-blob --location ./azurite-data --blobHost 127.0.0.1 --blobPort 10000
+az storage container create --name valhalla --public-access blob
+az storage blob upload --container-name valhalla --name tiles.tar --file ./tiles.tar
+rati "http://127.0.0.1:10000/devstoreaccount1/valhalla/tiles.tar"
+```
+
+Plaintext (`http://`) endpoints are always treated as anonymous — rati will not put a
+bearer token on the wire in the clear — so the container must be public or the URL must
+carry a SAS.
 
 Note that Azure targets roughly 3,000 requests per second against a *single* block blob, and
 the partition key is account + container + blob name. With a CDN in front that ceiling is

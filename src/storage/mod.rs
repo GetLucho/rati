@@ -55,16 +55,16 @@ impl Storage {
         }
 
         #[cfg(feature = "azure")]
-        if source.starts_with("https://") {
+        if source.starts_with("https://") || source.starts_with("http://") {
             return Err(Error::Protocol(format!(
                 "{source} is not an Azure Blob endpoint; expected \
                  https://<account>.blob.core.windows.net/<container>/<blob>.tar"
             )));
         }
         #[cfg(not(feature = "azure"))]
-        if source.starts_with("https://") {
+        if source.starts_with("https://") || source.starts_with("http://") {
             return Err(Error::Protocol(
-                "HTTPS archives require the 'azure' cargo feature".into(),
+                "HTTP(S) archives require the 'azure' cargo feature".into(),
             ));
         }
 
