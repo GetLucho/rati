@@ -35,6 +35,19 @@ pub struct AzureOptions<'a> {
     pub _unused: std::marker::PhantomData<&'a ()>,
 }
 
+/// Strip the query string from an archive location before it is logged or put in an
+/// error.
+///
+/// An Azure Blob URL may carry a shared access signature there — `?...&sig=...` — which
+/// is a bearer credential. Anything that prints the archive location must go through
+/// this, or the token lands in stdout and every log aggregator downstream.
+pub fn redact(source: &str) -> &str {
+    match source.split_once('?') {
+        Some((head, _)) => head,
+        None => source,
+    }
+}
+
 /// Source metadata read once when the archive is opened.
 pub struct ArchiveSource {
     /// Source ETag — S3 object ETag, or synthesized `"<mtime>-<size>"` for local archives.
@@ -55,6 +68,8 @@ pub enum Storage {
     #[cfg(feature = "azure")]
     AzureBlob {
         client: Box<azure_storage_blob::BlobClient>,
+        /// ETag the index was built against; every read is pinned to it.
+        etag: Box<str>,
     },
     Local {
         // `Arc<std::fs::File>` lets us call `read_at` (which takes `&self`) concurrently
@@ -123,8 +138,33 @@ impl Storage {
                 key,
             } => s3::read_s3_range(client, bucket, key, offset, length).await,
             #[cfg(feature = "azure")]
-            Self::AzureBlob { client } => azure::read_azure_range(client, offset, length).await,
+            Self::AzureBlob { client, etag } => {
+                azure::read_azure_range(client, etag, offset, length).await
+            }
             Self::Local { file } => local::read_local_range(file.clone(), offset, length).await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redact_strips_the_query_string() {
+        // A SAS is a bearer credential and must never reach a log or an error.
+        assert_eq!(
+            redact("https://acct.blob.core.windows.net/t/p.tar?sv=2024-11-04&sig=SECRET"),
+            "https://acct.blob.core.windows.net/t/p.tar"
+        );
+        // Nothing to strip: left exactly as-is, including for the other backends.
+        assert_eq!(
+            redact("https://acct.blob.core.windows.net/t/p.tar"),
+            "https://acct.blob.core.windows.net/t/p.tar"
+        );
+        assert_eq!(redact("s3://bucket/planet.tar"), "s3://bucket/planet.tar");
+        assert_eq!(redact("/data/planet.tar"), "/data/planet.tar");
+        // A bare "?" still loses everything after it.
+        assert_eq!(redact("https://h/p.tar?"), "https://h/p.tar");
     }
 }

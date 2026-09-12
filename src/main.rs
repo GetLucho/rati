@@ -126,7 +126,9 @@ async fn run(config: Config) {
     .expect("failed to load tar index");
     info!(
         "Loaded {} with {} tiles (dataset_id={})",
-        config.archive, meta.tile_count, meta.dataset_id,
+        storage::redact(&config.archive),
+        meta.tile_count,
+        meta.dataset_id,
     );
 
     let cache_headers = build_cache_headers(&meta, config.cache_max_age);
