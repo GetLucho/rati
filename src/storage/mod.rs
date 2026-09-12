@@ -2,6 +2,8 @@
 //! every read goes through [`Storage::read_range`]; everything above this layer is unaware
 //! of the source.
 
+#[cfg(feature = "azure")]
+mod azure;
 mod local;
 #[cfg(feature = "s3")]
 mod s3;
