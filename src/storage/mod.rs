@@ -3,6 +3,7 @@
 //! of the source.
 
 mod local;
+#[cfg(feature = "s3")]
 mod s3;
 
 use std::sync::Arc;
@@ -22,6 +23,7 @@ pub struct ArchiveSource {
 }
 
 pub enum Storage {
+    #[cfg(feature = "s3")]
     S3 {
         client: aws_sdk_s3::Client,
         bucket: Box<str>,
@@ -37,11 +39,18 @@ pub enum Storage {
 impl Storage {
     /// Open `source`: an S3 URL (`s3://bucket/key`) or a local filesystem path.
     pub async fn open(source: &str) -> Result<(Self, ArchiveSource), Error> {
+        #[cfg(feature = "s3")]
         if let Some((bucket, key)) = s3::parse_s3_url(source) {
-            s3::open_s3(bucket, key).await
-        } else {
-            local::open_local(source)
+            return s3::open_s3(bucket, key).await;
         }
+
+        if source.starts_with("s3://") {
+            return Err(Error::Protocol(
+                "S3 archives require the 's3' cargo feature".into(),
+            ));
+        }
+
+        local::open_local(source)
     }
 
     /// Read `length` bytes at `offset`. The only place where the backends diverge.
@@ -51,6 +60,7 @@ impl Storage {
         }
 
         match self {
+            #[cfg(feature = "s3")]
             Self::S3 {
                 client,
                 bucket,
