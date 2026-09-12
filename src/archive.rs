@@ -1,10 +1,8 @@
 //! Tar archive index parsing and tile lookups, reading bytes through a [`Storage`] backend.
 //!
-//!
 //! Loads the tar index via a handful of small range reads — no full download:
 //!
-//! 1. Source-specific metadata: S3 `HeadObject` (ETag, Last-Modified, size) or
-//!    filesystem `metadata()` (mtime, size; ETag synthesized from mtime+size).
+//! 1. Source metadata from the backend — see [`crate::storage`].
 //! 2. First 512 bytes — the leading tar header, expected to name `index.bin`. If it
 //!    doesn't and `--scan-index` is set, fall back to [`scan_tar_headers`] which walks
 //!    the whole archive in 8 MB chunks with prefetch.
