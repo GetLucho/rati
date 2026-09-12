@@ -12,7 +12,7 @@ include = ["**/*.rs"]
 [features]
 default = ["s3"]
 s3 = ["dep:aws-config", "dep:aws-sdk-s3"]
-azure = []
+azure = ["dep:azure_core", "dep:azure_identity", "dep:azure_storage_blob"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -24,6 +24,9 @@ lto = "thin"
 aws-config = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client", "sso"], optional = true }
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"], optional = true }
 axum = "0.8"
+azure_core = { version = "1.1.0", optional = true }
+azure_identity = { version = "1.0.0", optional = true }
+azure_storage_blob = { version = "1.1.0", optional = true }
 bytes = "1"
 clap = { version = "4.6", features = ["derive"] }
 flate2 = "1"

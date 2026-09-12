@@ -39,6 +39,32 @@ pub(super) fn has_sas_token(url: &str) -> bool {
         .any(|param| param.split_once('=').is_some_and(|(k, _)| k == "sig"))
 }
 
+/// Which credential rati should present to Azure Blob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CredentialKind {
+    /// The URL carries a SAS; no credential needed.
+    Anonymous,
+    /// Running on Azure — Container Apps, App Service, or a VM.
+    ManagedIdentity,
+    /// Local development; chains the az and azd CLIs.
+    DeveloperTools,
+}
+
+/// Pick a credential from the URL and the ambient environment.
+///
+/// Azure Container Apps injects `IDENTITY_ENDPOINT` (with `IDENTITY_HEADER`) for
+/// both system- and user-assigned identities, which is what `azure_identity`'s
+/// App Service source reads.
+pub(super) fn select_credential_kind(url: &str, identity_endpoint: Option<&str>) -> CredentialKind {
+    if has_sas_token(url) {
+        CredentialKind::Anonymous
+    } else if identity_endpoint.is_some_and(|e| !e.is_empty()) {
+        CredentialKind::ManagedIdentity
+    } else {
+        CredentialKind::DeveloperTools
+    }
+}
+
 /// Extract the total resource length from a `Content-Range` header value.
 ///
 /// Per RFC 9110 §14.4 the value is `bytes <range>/<complete-length>`, where the
@@ -96,6 +122,31 @@ mod tests {
         assert!(!has_sas_token(
             "https://acct.blob.core.windows.net/t/p.tar?nosig=x"
         ));
+    }
+
+    #[test]
+    fn select_credential_kind_test() {
+        use CredentialKind::*;
+
+        let plain = "https://acct.blob.core.windows.net/t/p.tar";
+        let sas = "https://acct.blob.core.windows.net/t/p.tar?sv=1&sig=abc";
+
+        // A SAS in the URL authenticates the request on its own.
+        assert_eq!(select_credential_kind(sas, None), Anonymous);
+        assert_eq!(
+            select_credential_kind(sas, Some("http://169.254.0.1/token")),
+            Anonymous
+        );
+
+        // Container Apps injects IDENTITY_ENDPOINT.
+        assert_eq!(
+            select_credential_kind(plain, Some("http://169.254.0.1/token")),
+            ManagedIdentity
+        );
+
+        // Local development falls back to the az CLI.
+        assert_eq!(select_credential_kind(plain, None), DeveloperTools);
+        assert_eq!(select_credential_kind(plain, Some("")), DeveloperTools);
     }
 
     #[test]
