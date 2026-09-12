@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use azure_core::credentials::TokenCredential;
+use azure_core::http::Etag;
 use azure_core::http::Url;
 use azure_core::http::headers::HeaderName;
 use azure_identity::{
@@ -14,7 +15,7 @@ use azure_storage_blob::BlobClient;
 use azure_storage_blob::models::{BlobClientDownloadOptions, HttpRange};
 use bytes::Bytes;
 
-use super::{ArchiveSource, Storage};
+use super::{ArchiveSource, Storage, redact};
 use crate::archive::Error;
 
 /// Bytes read to probe the archive: one tar header block.
@@ -392,8 +393,8 @@ pub(super) async fn open_azure(
     service_connection_id: Option<&str>,
     override_kind: Option<CredentialKind>,
 ) -> Result<(Storage, ArchiveSource), Error> {
-    let parsed =
-        Url::parse(url).map_err(|e| Error::Protocol(format!("invalid blob URL {url}: {e}")))?;
+    let parsed = Url::parse(url)
+        .map_err(|e| Error::Protocol(format!("invalid blob URL {}: {e}", redact(url))))?;
     let kind = select_credential_kind(url, &CredentialEnv::from_process(), override_kind);
     let credential = build_credential(url, user_assigned, service_connection_id, override_kind)?;
 
@@ -411,7 +412,8 @@ pub(super) async fn open_azure(
             // failure surfaces here rather than at construction. Name the credential
             // that was tried — the SDK's own message does not.
             Error::Io(format!(
-                "reading {url} failed using the {kind:?} credential: {e}{}",
+                "reading {} failed using the {kind:?} credential: {e}{}",
+                redact(url),
                 credential_hint(kind)
             ))
         })?;
@@ -440,6 +442,9 @@ pub(super) async fn open_azure(
     Ok((
         Storage::AzureBlob {
             client: Box::new(client),
+            // Pinned so a mid-flight republish fails loudly instead of serving bytes
+            // read at stale offsets. See `read_azure_range`.
+            etag: etag.clone(),
         },
         ArchiveSource {
             etag,
@@ -450,24 +455,48 @@ pub(super) async fn open_azure(
 }
 
 /// Read `length` bytes at `offset` from the blob.
+///
+/// Every read is conditional on the ETag captured when the archive was opened. The tile
+/// index maps ids to byte offsets in one specific version of the blob, so if the archive
+/// is replaced while rati is running those offsets now point into different data. Without
+/// the guard the service happily returns whatever occupies that range, and rati serves it
+/// under the old ETag and `Cache-Control: immutable` — silently poisoning client and CDN
+/// caches. With it, Azure answers 412 and the read fails visibly.
 pub(super) async fn read_azure_range(
     client: &BlobClient,
+    etag: &str,
     offset: u64,
     length: u64,
 ) -> Result<Bytes, Error> {
     let response = client
         .download(Some(BlobClientDownloadOptions {
             range: Some(HttpRange::new(offset, length)),
+            if_match: Some(Etag::from(etag)),
             ..Default::default()
         }))
         .await
-        .map_err(|e| Error::Io(format!("blob download(offset={offset}, len={length}): {e}")))?;
+        .map_err(|e| {
+            Error::Io(format!(
+                "blob download(offset={offset}, len={length}): {e} \
+                 (a 412 here means the archive was replaced while rati was running; restart it)"
+            ))
+        })?;
 
-    response
+    let data = response
         .body
         .collect()
         .await
-        .map_err(|e| Error::Io(format!("reading blob response body: {e}")))
+        .map_err(|e| Error::Io(format!("reading blob response body: {e}")))?;
+
+    // fix 3: the callers index into what comes back assuming it is exactly `length`
+    // bytes; `scan_tar_headers` subtracts from `chunk.len()` and would underflow.
+    if data.len() as u64 != length {
+        return Err(Error::Io(format!(
+            "short read at offset={offset}: asked for {length} bytes, got {}",
+            data.len()
+        )));
+    }
+    Ok(data)
 }
 
 #[cfg(test)]
