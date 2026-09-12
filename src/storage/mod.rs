@@ -54,10 +54,17 @@ impl Storage {
             return azure::open_azure(source, azure_user_assigned_id).await;
         }
 
+        #[cfg(feature = "azure")]
+        if source.starts_with("https://") {
+            return Err(Error::Protocol(format!(
+                "{source} is not an Azure Blob endpoint; expected \
+                 https://<account>.blob.core.windows.net/<container>/<blob>.tar"
+            )));
+        }
+        #[cfg(not(feature = "azure"))]
         if source.starts_with("https://") {
             return Err(Error::Protocol(
-                "HTTPS archives must be Azure Blob URLs, and require the 'azure' cargo feature"
-                    .into(),
+                "HTTPS archives require the 'azure' cargo feature".into(),
             ));
         }
 
@@ -66,6 +73,7 @@ impl Storage {
             return s3::open_s3(bucket, key).await;
         }
 
+        #[cfg(not(feature = "s3"))]
         if source.starts_with("s3://") {
             return Err(Error::Protocol(
                 "S3 archives require the 's3' cargo feature".into(),

@@ -10,7 +10,7 @@ license = "MIT OR Apache-2.0"
 include = ["**/*.rs"]
 
 [features]
-default = ["s3"]
+default = ["s3", "azure"]
 s3 = ["dep:aws-config", "dep:aws-sdk-s3"]
 azure = ["dep:azure_core", "dep:azure_identity", "dep:azure_storage_blob"]
 
