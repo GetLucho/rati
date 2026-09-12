@@ -1,8 +1,26 @@
 //! Azure Blob Storage backend: byte-range reads against a blob holding the tar archive.
 
-// These helpers are consumed by `open_azure` / `read_azure_range`, added in the
-// following commit. Removed once the backend itself lands.
-#![allow(dead_code)]
+use std::sync::Arc;
+
+use azure_core::credentials::TokenCredential;
+use azure_core::http::Url;
+use azure_core::http::headers::HeaderName;
+use azure_identity::{
+    DeveloperToolsCredential, ManagedIdentityCredential, ManagedIdentityCredentialOptions,
+    UserAssignedId,
+};
+use azure_storage_blob::BlobClient;
+use azure_storage_blob::models::{BlobClientDownloadOptions, HttpRange};
+use bytes::Bytes;
+
+use super::{ArchiveSource, Storage};
+use crate::archive::Error;
+
+/// Bytes read to probe the archive: one tar header block.
+const PROBE_LEN: u64 = 512;
+
+/// The SDK keeps its own `ContentRange` type private, so read the header directly.
+const CONTENT_RANGE: HeaderName = HeaderName::from_static("content-range");
 
 /// Host suffixes that identify an Azure Blob endpoint, across public and sovereign clouds.
 const BLOB_HOST_SUFFIXES: [&str; 4] = [
@@ -77,6 +95,109 @@ pub(super) fn parse_content_range_total(header: &str) -> Option<u64> {
         .trim()
         .parse()
         .ok()
+}
+
+/// Build the credential rati presents to Azure Blob for `url`.
+fn build_credential(
+    url: &str,
+    user_assigned_id: Option<&str>,
+) -> Result<Option<Arc<dyn TokenCredential>>, Error> {
+    let identity_endpoint = std::env::var("IDENTITY_ENDPOINT").ok();
+    match select_credential_kind(url, identity_endpoint.as_deref()) {
+        CredentialKind::Anonymous => Ok(None),
+        CredentialKind::ManagedIdentity => {
+            let options = user_assigned_id.map(|id| ManagedIdentityCredentialOptions {
+                user_assigned_id: Some(UserAssignedId::ClientId(id.to_string())),
+                ..Default::default()
+            });
+            let credential = ManagedIdentityCredential::new(options)
+                .map_err(|e| Error::Io(format!("managed identity credential: {e}")))?;
+            Ok(Some(credential))
+        }
+        CredentialKind::DeveloperTools => {
+            let credential = DeveloperToolsCredential::new(None)
+                .map_err(|e| Error::Io(format!("developer tools credential: {e}")))?;
+            Ok(Some(credential))
+        }
+    }
+}
+
+/// Open the archive from Azure Blob Storage.
+///
+/// Reads the leading tar block to pick up the blob's ETag, Last-Modified, and total
+/// size in one request: `get_properties` returns its values as raw headers, whereas a
+/// ranged `download` hands back a typed `BlobDownloadProperties`.
+pub(super) async fn open_azure(
+    url: &str,
+    user_assigned_id: Option<&str>,
+) -> Result<(Storage, ArchiveSource), Error> {
+    let parsed =
+        Url::parse(url).map_err(|e| Error::Protocol(format!("invalid blob URL {url}: {e}")))?;
+    let credential = build_credential(url, user_assigned_id)?;
+
+    let client = BlobClient::new(parsed, credential, None)
+        .map_err(|e| Error::Io(format!("creating blob client: {e}")))?;
+
+    let probe = client
+        .download(Some(BlobClientDownloadOptions {
+            range: Some(HttpRange::new(0, PROBE_LEN)),
+            ..Default::default()
+        }))
+        .await
+        .map_err(|e| Error::Io(format!("blob metadata probe failed: {e}")))?;
+
+    let etag: Box<str> = probe
+        .properties
+        .etag
+        .as_ref()
+        .map(ToString::to_string)
+        .ok_or_else(|| Error::Protocol("blob response carried no ETag".into()))?
+        .into();
+
+    let last_modified: Box<str> = probe
+        .properties
+        .last_modified
+        .map(|t| httpdate::fmt_http_date(t.into()))
+        .ok_or_else(|| Error::Protocol("blob response carried no Last-Modified".into()))?
+        .into();
+
+    let size = probe
+        .headers
+        .get_optional_str(&CONTENT_RANGE)
+        .and_then(parse_content_range_total)
+        .ok_or_else(|| Error::Protocol("blob response carried no usable Content-Range".into()))?;
+
+    Ok((
+        Storage::AzureBlob {
+            client: Box::new(client),
+        },
+        ArchiveSource {
+            etag,
+            last_modified,
+            size,
+        },
+    ))
+}
+
+/// Read `length` bytes at `offset` from the blob.
+pub(super) async fn read_azure_range(
+    client: &BlobClient,
+    offset: u64,
+    length: u64,
+) -> Result<Bytes, Error> {
+    let response = client
+        .download(Some(BlobClientDownloadOptions {
+            range: Some(HttpRange::new(offset, length)),
+            ..Default::default()
+        }))
+        .await
+        .map_err(|e| Error::Io(format!("blob download(offset={offset}, len={length}): {e}")))?;
+
+    response
+        .body
+        .collect()
+        .await
+        .map_err(|e| Error::Io(format!("reading blob response body: {e}")))
 }
 
 #[cfg(test)]

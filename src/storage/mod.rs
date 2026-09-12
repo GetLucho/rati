@@ -1,4 +1,5 @@
-//! Storage backends for a tar archive. Hides whether bytes come from S3 or a local file —
+//! Storage backends for a tar archive. Hides whether bytes come from S3, Azure Blob,
+//! or a local file —
 //! every read goes through [`Storage::read_range`]; everything above this layer is unaware
 //! of the source.
 
@@ -31,6 +32,10 @@ pub enum Storage {
         bucket: Box<str>,
         key: Box<str>,
     },
+    #[cfg(feature = "azure")]
+    AzureBlob {
+        client: Box<azure_storage_blob::BlobClient>,
+    },
     Local {
         // `Arc<std::fs::File>` lets us call `read_at` (which takes `&self`) concurrently
         // from multiple `spawn_blocking` tasks without `try_clone()` syscalls per read.
@@ -40,7 +45,22 @@ pub enum Storage {
 
 impl Storage {
     /// Open `source`: an S3 URL (`s3://bucket/key`) or a local filesystem path.
-    pub async fn open(source: &str) -> Result<(Self, ArchiveSource), Error> {
+    pub async fn open(
+        source: &str,
+        #[allow(unused_variables)] azure_user_assigned_id: Option<&str>,
+    ) -> Result<(Self, ArchiveSource), Error> {
+        #[cfg(feature = "azure")]
+        if azure::is_azure_url(source) {
+            return azure::open_azure(source, azure_user_assigned_id).await;
+        }
+
+        if source.starts_with("https://") {
+            return Err(Error::Protocol(
+                "HTTPS archives must be Azure Blob URLs, and require the 'azure' cargo feature"
+                    .into(),
+            ));
+        }
+
         #[cfg(feature = "s3")]
         if let Some((bucket, key)) = s3::parse_s3_url(source) {
             return s3::open_s3(bucket, key).await;
@@ -68,6 +88,8 @@ impl Storage {
                 bucket,
                 key,
             } => s3::read_s3_range(client, bucket, key, offset, length).await,
+            #[cfg(feature = "azure")]
+            Self::AzureBlob { client } => azure::read_azure_range(client, offset, length).await,
             Self::Local { file } => local::read_local_range(file.clone(), offset, length).await,
         }
     }

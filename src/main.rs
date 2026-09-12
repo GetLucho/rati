@@ -24,7 +24,7 @@ use archive::TileCompression;
 
 #[derive(Parser)]
 struct Config {
-    /// Archive location: `s3://bucket/key.tar` or a local filesystem path
+    /// Archive location: `s3://bucket/key.tar`, an Azure Blob HTTPS URL, or a local path
     archive: String,
     /// Build index by scanning tar headers if index.bin is missing
     #[arg(long)]
@@ -41,6 +41,9 @@ struct Config {
     /// Max threads to use
     #[arg(long, default_value_t = NonZero::new(4).unwrap())]
     concurrency: NonZero<u16>,
+    /// Client ID of a user-assigned managed identity for Azure Blob archives
+    #[arg(long, env = "AZURE_CLIENT_ID")]
+    azure_user_assigned_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -73,6 +76,7 @@ async fn run(config: Config) {
         &config.archive,
         config.scan_index,
         config.dataset_id.as_deref(),
+        config.azure_user_assigned_id.as_deref(),
     )
     .await
     .expect("failed to load tar index");
