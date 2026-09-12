@@ -7,7 +7,7 @@
 mod azure;
 
 #[cfg(feature = "azure")]
-pub use azure::CredentialKind;
+pub use azure::{CredentialKind, UserAssignedIdKind};
 mod local;
 #[cfg(feature = "s3")]
 mod s3;
@@ -22,9 +22,12 @@ use crate::archive::Error;
 /// other backends, and for every backend when the `azure` feature is off.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AzureOptions<'a> {
-    /// Client ID of a user-assigned managed identity.
+    /// Id of a user-assigned managed identity, and which kind of id it is.
     #[cfg(feature = "azure")]
-    pub user_assigned_id: Option<&'a str>,
+    pub user_assigned: Option<(&'a str, azure::UserAssignedIdKind)>,
+    /// Azure Pipelines service connection id.
+    #[cfg(feature = "azure")]
+    pub service_connection_id: Option<&'a str>,
     /// Force a credential instead of detecting one from the environment.
     #[cfg(feature = "azure")]
     pub credential: Option<azure::CredentialKind>,
@@ -68,7 +71,13 @@ impl Storage {
     ) -> Result<(Self, ArchiveSource), Error> {
         #[cfg(feature = "azure")]
         if azure::is_azure_url(source) {
-            return azure::open_azure(source, opts.user_assigned_id, opts.credential).await;
+            return azure::open_azure(
+                source,
+                opts.user_assigned,
+                opts.service_connection_id,
+                opts.credential,
+            )
+            .await;
         }
 
         #[cfg(feature = "azure")]

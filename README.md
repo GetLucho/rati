@@ -27,7 +27,10 @@ rati <archive> [OPTIONS]
 | `--cache-max-age <SECONDS>` | `86400` | `Cache-Control` max-age in seconds |
 | `--port <PORT>` | `3000` | Port to listen on |
 | `--concurrency <N>` | `4` | Max worker threads |
-| `--azure-user-assigned-id <ID>` | none | Client ID of a user-assigned managed identity (env: `AZURE_CLIENT_ID`) |
+| `--azure-credential <KIND>` | auto-detect | Force a credential: `anonymous`, `azure-pipelines`, `workload-identity`, `client-certificate`, `client-secret`, `managed-identity`, `developer-tools` |
+| `--azure-user-assigned-id <ID>` | none | Id of a user-assigned managed identity (env: `RATI_AZURE_USER_ASSIGNED_ID`) |
+| `--azure-user-assigned-id-kind <K>` | `client` | How to read that id: `client`, `object`, `resource` |
+| `--azure-service-connection-id <ID>` | none | Azure Pipelines service connection (env: `AZURE_SERVICE_CONNECTION_ID`) |
 
 ### Example with Valhalla
 
@@ -55,22 +58,69 @@ See [`valhalla_build_config`](https://github.com/valhalla/valhalla/blob/master/s
 rati "https://myaccount.blob.core.windows.net/valhalla/tiles.tar" --port 8080
 ```
 
-Credentials are resolved in this order:
+Credentials are resolved in this order. The first row whose condition holds wins;
+`--azure-credential <kind>` skips detection entirely.
 
-| Condition | Credential |
-|-----------|------------|
-| URL contains a SAS (`?...&sig=...`) | none — the signature authenticates the request |
-| `IDENTITY_ENDPOINT` is set (Azure Container Apps, App Service) | managed identity; pass `--azure-user-assigned-id` for a user-assigned one |
-| otherwise | the Azure CLI (`az login`) |
+| # | Condition | Credential | `--azure-credential` |
+|---|-----------|------------|----------------------|
+| 1 | URL is `http://`, or carries a SAS (`?...&sig=...`) | none | `anonymous` |
+| 2 | `SYSTEM_OIDCREQUESTURI` + `AZURE_TENANT_ID` + `AZURE_CLIENT_ID` | Azure Pipelines service connection | `azure-pipelines` |
+| 3 | `AZURE_FEDERATED_TOKEN_FILE` | Workload Identity (AKS) | `workload-identity` |
+| 4 | `AZURE_TENANT_ID` + `AZURE_CLIENT_ID` + `AZURE_CLIENT_CERTIFICATE_PATH` | service principal, certificate | `client-certificate` |
+| 5 | `AZURE_TENANT_ID` + `AZURE_CLIENT_ID` + `AZURE_CLIENT_SECRET` | service principal, secret | `client-secret` |
+| 6 | `IDENTITY_ENDPOINT` or `MSI_ENDPOINT` | managed identity | `managed-identity` |
+| 7 | otherwise | Azure CLI / Azure Developer CLI | `developer-tools` |
 
-Managed identity needs the **Storage Blob Data Reader** role on the account or container:
+The ordering matches `DefaultAzureCredential` in the other Azure SDKs: an explicitly
+configured identity outranks an ambient one. It matters because these markers overlap —
+the AKS workload-identity webhook also sets `AZURE_CLIENT_ID` and `AZURE_TENANT_ID`, so a
+stale secret in the environment must not displace the projected token.
+
+Two cases detection cannot see, which is what `--azure-credential` is for:
+
+- **A plain Azure VM or VMSS** exposes no marker at all. IMDS is reachable but invisible,
+  so pass `--azure-credential managed-identity`.
+- **A container image without the Azure CLI** falls through to row 7 and fails looking for
+  `az`. Name the credential you actually have.
+
+### User-assigned managed identity
+
+```sh
+rati "https://myaccount.blob.core.windows.net/valhalla/tiles.tar" \
+  --azure-credential managed-identity \
+  --azure-user-assigned-id <client-id>
+```
+
+`--azure-user-assigned-id-kind` selects how that id is interpreted: `client` (default),
+`object`, or `resource`. The flag reads `RATI_AZURE_USER_ASSIGNED_ID`, deliberately *not*
+`AZURE_CLIENT_ID` — the Azure SDK reads that variable itself for workload identity and
+service-principal auth, so adopting it would hijack an already-meaningful setting.
+
+### Certificate auth needs a cargo feature
+
+`client-certificate` is the one credential that is not in the default build:
+`azure_identity`'s `client_certificate` feature links OpenSSL, which the musl image
+deliberately avoids. Build with `--features azure-client-certificate` to enable it.
+Without it, a build that finds `AZURE_CLIENT_CERTIFICATE_PATH` set says so rather than
+silently falling through to another credential.
+
+### Role assignment
+
+Every credential above needs data-plane permission — **Storage Blob Data Reader** on the
+account or container:
 
 ```sh
 az role assignment create \
   --role "Storage Blob Data Reader" \
-  --assignee <managed-identity-principal-id> \
+  --assignee <principal-id> \
   --scope "/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Storage/storageAccounts/<account>"
 ```
+
+Account-level RBAC is separate from data-plane RBAC: Owner or Contributor on the storage
+account does **not** grant blob read.
+
+Do not set `Content-Encoding` on the archive blob. Azure applies ranges to stored bytes
+regardless, but a blob-level encoding confuses CDNs and proxies in front of rati.
 
 ### Testing against Azurite
 
@@ -98,6 +148,7 @@ far away, but it is the number to watch if you serve tiles to origin directly.
 |---------|---------|----------|
 | `s3` | yes | `aws-config`, `aws-sdk-s3` |
 | `azure` | yes | `azure_storage_blob`, `azure_identity` |
+| `azure-client-certificate` | no | adds OpenSSL, for service-principal certificate auth |
 
 Local archives need neither. Dropping an unused backend removes its HTTP and TLS stack:
 

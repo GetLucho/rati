@@ -6,8 +6,9 @@ use azure_core::credentials::TokenCredential;
 use azure_core::http::Url;
 use azure_core::http::headers::HeaderName;
 use azure_identity::{
-    DeveloperToolsCredential, ManagedIdentityCredential, ManagedIdentityCredentialOptions,
-    UserAssignedId, WorkloadIdentityCredential,
+    AzurePipelinesCredential, ClientSecretCredential, DeveloperToolsCredential,
+    ManagedIdentityCredential, ManagedIdentityCredentialOptions, UserAssignedId,
+    WorkloadIdentityCredential,
 };
 use azure_storage_blob::BlobClient;
 use azure_storage_blob::models::{BlobClientDownloadOptions, HttpRange};
@@ -87,13 +88,32 @@ pub(super) fn has_sas_token(url: &str) -> bool {
 pub enum CredentialKind {
     /// No credential: a SAS in the URL, a public container, or a plaintext endpoint.
     Anonymous,
+    /// An Azure Pipelines service connection (`SYSTEM_OIDCREQUESTURI`).
+    AzurePipelines,
     /// Entra Workload ID — an AKS pod with a projected federated token.
     WorkloadIdentity,
+    /// A service principal holding a certificate. Requires the
+    /// `azure-client-certificate` cargo feature, which links OpenSSL.
+    ClientCertificate,
+    /// A service principal holding a secret — the usual CI credential.
+    ClientSecret,
     /// A managed identity: Container Apps, App Service, Arc, Cloud Shell, or IMDS
     /// on a plain VM or VMSS.
     ManagedIdentity,
     /// Local development; chains the az and azd CLIs.
     DeveloperTools,
+}
+
+/// Which kind of id `--azure-user-assigned-id` carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum UserAssignedIdKind {
+    /// The identity's client (application) id. The usual choice.
+    #[default]
+    Client,
+    /// The identity's object (principal) id.
+    Object,
+    /// The identity's full ARM resource id.
+    Resource,
 }
 
 /// The environment markers that identify where rati is running.
@@ -108,6 +128,16 @@ pub(super) struct CredentialEnv<'a> {
     pub msi_endpoint: Option<&'a str>,
     /// Set by the AKS workload-identity webhook.
     pub federated_token_file: Option<&'a str>,
+    /// Set inside an Azure Pipelines job that has an OIDC-capable connection.
+    pub oidc_request_uri: Option<&'a str>,
+    /// Service-principal tenant. Required by every service-principal credential.
+    pub tenant_id: Option<&'a str>,
+    /// Service-principal application id.
+    pub client_id: Option<&'a str>,
+    /// Service-principal secret.
+    pub client_secret: Option<&'a str>,
+    /// PEM or PKCS#12 file holding a service-principal certificate.
+    pub client_certificate_path: Option<&'a str>,
 }
 
 impl CredentialEnv<'static> {
@@ -125,6 +155,11 @@ impl CredentialEnv<'static> {
             identity_endpoint: var("IDENTITY_ENDPOINT"),
             msi_endpoint: var("MSI_ENDPOINT"),
             federated_token_file: var("AZURE_FEDERATED_TOKEN_FILE"),
+            oidc_request_uri: var("SYSTEM_OIDCREQUESTURI"),
+            tenant_id: var("AZURE_TENANT_ID"),
+            client_id: var("AZURE_CLIENT_ID"),
+            client_secret: var("AZURE_CLIENT_SECRET"),
+            client_certificate_path: var("AZURE_CLIENT_CERTIFICATE_PATH"),
         }
     }
 }
@@ -154,9 +189,19 @@ pub(super) fn select_credential_kind(
     }
 
     let set = |v: Option<&str>| v.is_some_and(|s| !s.is_empty());
+    let service_principal = set(env.tenant_id) && set(env.client_id);
 
-    if set(env.federated_token_file) {
+    // Ordering mirrors DefaultAzureCredential in the other Azure SDKs: an
+    // explicitly configured identity outranks an ambient one, and the most
+    // specific marker wins. A pod or pipeline can carry several of these at once.
+    if set(env.oidc_request_uri) && service_principal {
+        CredentialKind::AzurePipelines
+    } else if set(env.federated_token_file) {
         CredentialKind::WorkloadIdentity
+    } else if service_principal && set(env.client_certificate_path) {
+        CredentialKind::ClientCertificate
+    } else if service_principal && set(env.client_secret) {
+        CredentialKind::ClientSecret
     } else if set(env.identity_endpoint) || set(env.msi_endpoint) {
         CredentialKind::ManagedIdentity
     } else {
@@ -193,14 +238,33 @@ fn credential_hint(kind: CredentialKind) -> &'static str {
             " (AZURE_FEDERATED_TOKEN_FILE is set but the projected token was rejected; \
              check the federated credential and that the identity has Storage Blob Data Reader)"
         }
-        CredentialKind::DeveloperTools => " (try `az login`)",
+        CredentialKind::DeveloperTools => {
+            " (no Azure environment markers were found; run `az login`, or name a \
+             credential with --azure-credential)"
+        }
+        CredentialKind::ClientSecret | CredentialKind::ClientCertificate => {
+            " (check AZURE_TENANT_ID / AZURE_CLIENT_ID and that the service principal \
+             has Storage Blob Data Reader)"
+        }
+        CredentialKind::AzurePipelines => {
+            " (check the service connection is OIDC-capable and SYSTEM_ACCESSTOKEN is \
+             exposed to this step)"
+        }
     }
+}
+
+/// Required environment variable, reported by name when absent.
+fn require<'a>(value: Option<&'a str>, name: &str, kind: CredentialKind) -> Result<&'a str, Error> {
+    value
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| Error::Protocol(format!("{kind:?} credential needs {name} to be set")))
 }
 
 /// Build the credential rati presents to Azure Blob for `url`.
 fn build_credential(
     url: &str,
-    user_assigned_id: Option<&str>,
+    user_assigned: Option<(&str, UserAssignedIdKind)>,
+    service_connection_id: Option<&str>,
     override_kind: Option<CredentialKind>,
 ) -> Result<Option<Arc<dyn TokenCredential>>, Error> {
     let env = CredentialEnv::from_process();
@@ -209,26 +273,112 @@ fn build_credential(
 
     match kind {
         CredentialKind::Anonymous => Ok(None),
+
+        CredentialKind::AzurePipelines => {
+            let tenant = require(env.tenant_id, "AZURE_TENANT_ID", kind)?;
+            let client = require(env.client_id, "AZURE_CLIENT_ID", kind)?;
+            let connection = service_connection_id
+                .or(env_var_static("AZURE_SERVICE_CONNECTION_ID"))
+                .ok_or_else(|| {
+                    Error::Protocol(
+                        "AzurePipelines credential needs --azure-service-connection-id \
+                         (or AZURE_SERVICE_CONNECTION_ID)"
+                            .into(),
+                    )
+                })?;
+            let token = require(
+                env_var_static("SYSTEM_ACCESSTOKEN"),
+                "SYSTEM_ACCESSTOKEN",
+                kind,
+            )?;
+            let credential = AzurePipelinesCredential::new(
+                tenant.to_string(),
+                client.to_string(),
+                connection,
+                token.to_string(),
+                None,
+            )
+            .map_err(|e| Error::Io(format!("azure pipelines credential: {e}")))?;
+            Ok(Some(credential))
+        }
+
         CredentialKind::WorkloadIdentity => {
             let credential = WorkloadIdentityCredential::new(None)
                 .map_err(|e| Error::Io(format!("workload identity credential: {e}")))?;
             Ok(Some(credential))
         }
+
+        #[cfg(feature = "azure-client-certificate")]
+        CredentialKind::ClientCertificate => {
+            let tenant = require(env.tenant_id, "AZURE_TENANT_ID", kind)?;
+            let client = require(env.client_id, "AZURE_CLIENT_ID", kind)?;
+            let path = require(
+                env.client_certificate_path,
+                "AZURE_CLIENT_CERTIFICATE_PATH",
+                kind,
+            )?;
+            let bytes = std::fs::read(path)
+                .map_err(|e| Error::Io(format!("reading certificate {path}: {e}")))?;
+            let credential = azure_identity::ClientCertificateCredential::new(
+                tenant.to_string(),
+                client.to_string(),
+                bytes.into(),
+                None,
+            )
+            .map_err(|e| Error::Io(format!("client certificate credential: {e}")))?;
+            Ok(Some(credential))
+        }
+        #[cfg(not(feature = "azure-client-certificate"))]
+        CredentialKind::ClientCertificate => Err(Error::Protocol(
+            "AZURE_CLIENT_CERTIFICATE_PATH is set, but this build has no certificate \
+             support: rebuild with --features azure-client-certificate (it links OpenSSL), \
+             or use a client secret instead"
+                .into(),
+        )),
+
+        CredentialKind::ClientSecret => {
+            let tenant = require(env.tenant_id, "AZURE_TENANT_ID", kind)?;
+            let client = require(env.client_id, "AZURE_CLIENT_ID", kind)?;
+            let secret = require(env.client_secret, "AZURE_CLIENT_SECRET", kind)?;
+            let credential = ClientSecretCredential::new(
+                tenant,
+                client.to_string(),
+                secret.to_string().into(),
+                None,
+            )
+            .map_err(|e| Error::Io(format!("client secret credential: {e}")))?;
+            Ok(Some(credential))
+        }
+
         CredentialKind::ManagedIdentity => {
-            let options = user_assigned_id.map(|id| ManagedIdentityCredentialOptions {
-                user_assigned_id: Some(UserAssignedId::ClientId(id.to_string())),
+            let options = user_assigned.map(|(id, kind)| ManagedIdentityCredentialOptions {
+                user_assigned_id: Some(match kind {
+                    UserAssignedIdKind::Client => UserAssignedId::ClientId(id.to_string()),
+                    UserAssignedIdKind::Object => UserAssignedId::ObjectId(id.to_string()),
+                    UserAssignedIdKind::Resource => UserAssignedId::ResourceId(id.to_string()),
+                }),
                 ..Default::default()
             });
             let credential = ManagedIdentityCredential::new(options)
                 .map_err(|e| Error::Io(format!("managed identity credential: {e}")))?;
             Ok(Some(credential))
         }
+
         CredentialKind::DeveloperTools => {
             let credential = DeveloperToolsCredential::new(None)
                 .map_err(|e| Error::Io(format!("developer tools credential: {e}")))?;
             Ok(Some(credential))
         }
     }
+}
+
+/// Read an environment variable, leaked so it can be borrowed for `'static`.
+/// Only ever called a handful of times, at startup.
+fn env_var_static(key: &str) -> Option<&'static str> {
+    std::env::var(key)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(|v| &*Box::leak(v.into_boxed_str()))
 }
 
 /// Open the archive from Azure Blob Storage.
@@ -238,13 +388,14 @@ fn build_credential(
 /// ranged `download` hands back a typed `BlobDownloadProperties`.
 pub(super) async fn open_azure(
     url: &str,
-    user_assigned_id: Option<&str>,
+    user_assigned: Option<(&str, UserAssignedIdKind)>,
+    service_connection_id: Option<&str>,
     override_kind: Option<CredentialKind>,
 ) -> Result<(Storage, ArchiveSource), Error> {
     let parsed =
         Url::parse(url).map_err(|e| Error::Protocol(format!("invalid blob URL {url}: {e}")))?;
     let kind = select_credential_kind(url, &CredentialEnv::from_process(), override_kind);
-    let credential = build_credential(url, user_assigned_id, override_kind)?;
+    let credential = build_credential(url, user_assigned, service_connection_id, override_kind)?;
 
     let client = BlobClient::new(parsed, credential, None)
         .map_err(|e| Error::Io(format!("creating blob client: {e}")))?;
@@ -476,10 +627,111 @@ mod tests {
             identity_endpoint: Some(""),
             msi_endpoint: Some(""),
             federated_token_file: Some(""),
+            ..Default::default()
         };
         assert_eq!(
             select_credential_kind(PLAIN, &empty, None),
             CredentialKind::DeveloperTools
+        );
+    }
+
+    /// A GitHub Actions / generic CI service principal.
+    fn service_principal_secret() -> CredentialEnv<'static> {
+        CredentialEnv {
+            tenant_id: Some("t"),
+            client_id: Some("c"),
+            client_secret: Some("s"),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn service_principals_are_detected_from_the_environment() {
+        use CredentialKind::*;
+
+        assert_eq!(
+            select_credential_kind(PLAIN, &service_principal_secret(), None),
+            ClientSecret
+        );
+
+        let cert = CredentialEnv {
+            client_secret: None,
+            client_certificate_path: Some("/run/secrets/sp.pem"),
+            ..service_principal_secret()
+        };
+        assert_eq!(
+            select_credential_kind(PLAIN, &cert, None),
+            ClientCertificate
+        );
+
+        // A certificate outranks a secret when both are configured.
+        let both = CredentialEnv {
+            client_certificate_path: Some("/run/secrets/sp.pem"),
+            ..service_principal_secret()
+        };
+        assert_eq!(
+            select_credential_kind(PLAIN, &both, None),
+            ClientCertificate
+        );
+
+        // A secret without a tenant is not a usable service principal, so detection
+        // must fall through rather than pick a credential that cannot work.
+        let partial = CredentialEnv {
+            tenant_id: None,
+            ..service_principal_secret()
+        };
+        assert_eq!(
+            select_credential_kind(PLAIN, &partial, None),
+            DeveloperTools
+        );
+    }
+
+    #[test]
+    fn azure_pipelines_outranks_other_service_principal_markers() {
+        let pipeline = CredentialEnv {
+            oidc_request_uri: Some("https://dev.azure.com/o/_apis/distributedtask/oidctoken"),
+            ..service_principal_secret()
+        };
+        assert_eq!(
+            select_credential_kind(PLAIN, &pipeline, None),
+            CredentialKind::AzurePipelines
+        );
+
+        // ...but the OIDC endpoint alone, without a service principal, is not enough.
+        let uri_only = CredentialEnv {
+            oidc_request_uri: Some("https://dev.azure.com/o/_apis/distributedtask/oidctoken"),
+            ..Default::default()
+        };
+        assert_eq!(
+            select_credential_kind(PLAIN, &uri_only, None),
+            CredentialKind::DeveloperTools
+        );
+    }
+
+    #[test]
+    fn federated_token_outranks_a_client_secret() {
+        // The workload-identity webhook sets AZURE_CLIENT_ID and AZURE_TENANT_ID too,
+        // so a stale secret in the environment must not win over the projected token.
+        let pod = CredentialEnv {
+            federated_token_file: Some("/var/run/secrets/azure/tokens/azure-identity-token"),
+            ..service_principal_secret()
+        };
+        assert_eq!(
+            select_credential_kind(PLAIN, &pod, None),
+            CredentialKind::WorkloadIdentity
+        );
+    }
+
+    #[test]
+    fn service_principal_outranks_ambient_managed_identity() {
+        // An explicitly configured identity beats whatever the host happens to offer.
+        let both = CredentialEnv {
+            identity_endpoint: container_apps().identity_endpoint,
+            ..service_principal_secret()
+        };
+        assert_eq!(
+            select_credential_kind(PLAIN, &both, None),
+            CredentialKind::ClientSecret
         );
     }
 

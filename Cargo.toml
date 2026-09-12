@@ -13,6 +13,9 @@ include = ["**/*.rs"]
 default = ["s3", "azure"]
 s3 = ["dep:aws-config", "dep:aws-sdk-s3"]
 azure = ["dep:azure_core", "dep:azure_identity", "dep:azure_storage_blob"]
+# Service-principal certificate auth. Off by default: azure_identity's client_certificate
+# feature links OpenSSL, which the default musl image deliberately avoids.
+azure-client-certificate = ["azure", "azure_identity/client_certificate"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

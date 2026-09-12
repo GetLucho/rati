@@ -49,6 +49,14 @@ struct Config {
     #[cfg(feature = "azure")]
     #[arg(long, env = "RATI_AZURE_USER_ASSIGNED_ID", value_parser = non_empty)]
     azure_user_assigned_id: Option<String>,
+    /// Which kind of id `--azure-user-assigned-id` carries
+    #[cfg(feature = "azure")]
+    #[arg(long, value_enum, default_value_t = storage::UserAssignedIdKind::Client)]
+    azure_user_assigned_id_kind: storage::UserAssignedIdKind,
+    /// Azure Pipelines service connection id, for the azure-pipelines credential
+    #[cfg(feature = "azure")]
+    #[arg(long, env = "AZURE_SERVICE_CONNECTION_ID", value_parser = non_empty)]
+    azure_service_connection_id: Option<String>,
     /// Force an Azure credential instead of detecting one from the environment.
     ///
     /// A plain Azure VM or VMSS exposes no environment marker, so reaching IMDS
@@ -102,7 +110,12 @@ async fn run(config: Config) {
         config.dataset_id.as_deref(),
         storage::AzureOptions {
             #[cfg(feature = "azure")]
-            user_assigned_id: config.azure_user_assigned_id.as_deref(),
+            user_assigned: config
+                .azure_user_assigned_id
+                .as_deref()
+                .map(|id| (id, config.azure_user_assigned_id_kind)),
+            #[cfg(feature = "azure")]
+            service_connection_id: config.azure_service_connection_id.as_deref(),
             #[cfg(feature = "azure")]
             credential: config.azure_credential,
             #[cfg(not(feature = "azure"))]
