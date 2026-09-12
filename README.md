@@ -1,6 +1,6 @@
 # Rati
 
-Rati (Range-Accessed Tar Index) is a lightweight HTTP server that serves individual [Valhalla](https://github.com/valhalla/valhalla) tiles from tar archives — stored on S3 or on the local filesystem — via byte-range reads.
+Rati (Range-Accessed Tar Index) is a lightweight HTTP server that serves individual [Valhalla](https://github.com/valhalla/valhalla) tiles from tar archives — stored on S3, Azure Blob Storage, or on the local filesystem — via byte-range reads.
 Named after the auger Odin used to bore through a mountain to reach the mead of poetry locked within.
 
 Rati was created with two use cases in mind:
@@ -15,7 +15,9 @@ rati <archive> [OPTIONS]
 ```
 
 **Arguments:**
-- `<archive>` — Archive location. Either an S3 URL (`s3://bucket/path/to/tiles.tar`) or a path to a local `.tar` file. Anything not starting with `s3://` is treated as a local path.
+- `<archive>` — Archive location. An S3 URL (`s3://bucket/path/to/tiles.tar`), an Azure Blob
+  URL (`https://<account>.blob.core.windows.net/<container>/tiles.tar`), or a path to a local
+  `.tar` file. Anything else is treated as a local path.
 
 **Options:**
 | Flag | Default | Description |
@@ -25,6 +27,7 @@ rati <archive> [OPTIONS]
 | `--cache-max-age <SECONDS>` | `86400` | `Cache-Control` max-age in seconds |
 | `--port <PORT>` | `3000` | Port to listen on |
 | `--concurrency <N>` | `4` | Max worker threads |
+| `--azure-user-assigned-id <ID>` | none | Client ID of a user-assigned managed identity (env: `AZURE_CLIENT_ID`) |
 
 ### Example with Valhalla
 
@@ -45,6 +48,49 @@ rati ./tiles.tar --port 8080
 ```
 
 See [`valhalla_build_config`](https://github.com/valhalla/valhalla/blob/master/scripts/valhalla_build_config) for the full list of flags.
+
+### Azure Blob Storage
+
+```sh
+rati "https://myaccount.blob.core.windows.net/valhalla/tiles.tar" --port 8080
+```
+
+Credentials are resolved in this order:
+
+| Condition | Credential |
+|-----------|------------|
+| URL contains a SAS (`?...&sig=...`) | none — the signature authenticates the request |
+| `IDENTITY_ENDPOINT` is set (Azure Container Apps, App Service) | managed identity; pass `--azure-user-assigned-id` for a user-assigned one |
+| otherwise | the Azure CLI (`az login`) |
+
+Managed identity needs the **Storage Blob Data Reader** role on the account or container:
+
+```sh
+az role assignment create \
+  --role "Storage Blob Data Reader" \
+  --assignee <managed-identity-principal-id> \
+  --scope "/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Storage/storageAccounts/<account>"
+```
+
+Do not set `Content-Encoding` on the archive blob: the SDK's HTTP client negotiates gzip
+transparently, and a blob-level encoding would corrupt range offsets.
+
+Note that Azure targets roughly 3,000 requests per second against a *single* block blob, and
+the partition key is account + container + blob name. With a CDN in front that ceiling is
+far away, but it is the number to watch if you serve tiles to origin directly.
+
+## Build Features
+
+| Feature | Default | Pulls in |
+|---------|---------|----------|
+| `s3` | yes | `aws-config`, `aws-sdk-s3` |
+| `azure` | yes | `azure_storage_blob`, `azure_identity` |
+
+Local archives need neither. Dropping an unused backend removes its HTTP and TLS stack:
+
+```sh
+cargo build --release --no-default-features --features azure
+```
 
 ## Endpoints
 
