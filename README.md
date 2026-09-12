@@ -1,6 +1,6 @@
 # Rati
 
-Rati (Range-Accessed Tar Index) is a lightweight HTTP server that serves individual [Valhalla](https://github.com/valhalla/valhalla) tiles from tar archives — stored on S3 or on the local filesystem — via byte-range reads.
+Rati (Range-Accessed Tar Index) is a lightweight HTTP server that serves individual [Valhalla](https://github.com/valhalla/valhalla) tiles from tar archives — stored on S3, Azure Blob Storage, or on the local filesystem — via byte-range reads.
 Named after the auger Odin used to bore through a mountain to reach the mead of poetry locked within.
 
 Rati was created with two use cases in mind:
@@ -15,7 +15,9 @@ rati <archive> [OPTIONS]
 ```
 
 **Arguments:**
-- `<archive>` — Archive location. Either an S3 URL (`s3://bucket/path/to/tiles.tar`) or a path to a local `.tar` file. Anything not starting with `s3://` is treated as a local path.
+- `<archive>` — Archive location. An S3 URL (`s3://bucket/path/to/tiles.tar`), an Azure Blob
+  URL (`https://<account>.blob.core.windows.net/<container>/tiles.tar`), or a path to a local
+  `.tar` file. Anything else is treated as a local path.
 
 **Options:**
 | Flag | Default | Description |
@@ -25,6 +27,10 @@ rati <archive> [OPTIONS]
 | `--cache-max-age <SECONDS>` | `86400` | `Cache-Control` max-age in seconds |
 | `--port <PORT>` | `3000` | Port to listen on |
 | `--concurrency <N>` | `4` | Max worker threads |
+| `--azure-credential <KIND>` | auto-detect | Force a credential: `anonymous`, `azure-pipelines`, `workload-identity`, `client-certificate`, `client-secret`, `managed-identity`, `developer-tools` |
+| `--azure-user-assigned-id <ID>` | none | Id of a user-assigned managed identity (env: `RATI_AZURE_USER_ASSIGNED_ID`) |
+| `--azure-user-assigned-id-kind <K>` | `client` | How to read that id: `client`, `object`, `resource` |
+| `--azure-service-connection-id <ID>` | none | Azure Pipelines service connection (env: `AZURE_SERVICE_CONNECTION_ID`) |
 
 ### Example with Valhalla
 
@@ -45,6 +51,110 @@ rati ./tiles.tar --port 8080
 ```
 
 See [`valhalla_build_config`](https://github.com/valhalla/valhalla/blob/master/scripts/valhalla_build_config) for the full list of flags.
+
+### Azure Blob Storage
+
+```sh
+rati "https://myaccount.blob.core.windows.net/valhalla/tiles.tar" --port 8080
+```
+
+Credentials are resolved in this order. The first row whose condition holds wins;
+`--azure-credential <kind>` skips detection entirely.
+
+| # | Condition | Credential | `--azure-credential` |
+|---|-----------|------------|----------------------|
+| 1 | URL is `http://`, or carries a SAS (`?...&sig=...`) | none | `anonymous` |
+| 2 | `SYSTEM_OIDCREQUESTURI` + `AZURE_TENANT_ID` + `AZURE_CLIENT_ID` | Azure Pipelines service connection | `azure-pipelines` |
+| 3 | `AZURE_FEDERATED_TOKEN_FILE` | Workload Identity (AKS) | `workload-identity` |
+| 4 | `AZURE_TENANT_ID` + `AZURE_CLIENT_ID` + `AZURE_CLIENT_CERTIFICATE_PATH` | service principal, certificate | `client-certificate` |
+| 5 | `AZURE_TENANT_ID` + `AZURE_CLIENT_ID` + `AZURE_CLIENT_SECRET` | service principal, secret | `client-secret` |
+| 6 | `IDENTITY_ENDPOINT` or `MSI_ENDPOINT` | managed identity | `managed-identity` |
+| 7 | otherwise | Azure CLI / Azure Developer CLI | `developer-tools` |
+
+The ordering matches `DefaultAzureCredential` in the other Azure SDKs: an explicitly
+configured identity outranks an ambient one. It matters because these markers overlap —
+the AKS workload-identity webhook also sets `AZURE_CLIENT_ID` and `AZURE_TENANT_ID`, so a
+stale secret in the environment must not displace the projected token.
+
+Two cases detection cannot see, which is what `--azure-credential` is for:
+
+- **A plain Azure VM or VMSS** exposes no marker at all. IMDS is reachable but invisible,
+  so pass `--azure-credential managed-identity`.
+- **A container image without the Azure CLI** falls through to row 7 and fails looking for
+  `az`. Name the credential you actually have.
+
+### User-assigned managed identity
+
+```sh
+rati "https://myaccount.blob.core.windows.net/valhalla/tiles.tar" \
+  --azure-credential managed-identity \
+  --azure-user-assigned-id <client-id>
+```
+
+`--azure-user-assigned-id-kind` selects how that id is interpreted: `client` (default),
+`object`, or `resource`. The flag reads `RATI_AZURE_USER_ASSIGNED_ID`, deliberately *not*
+`AZURE_CLIENT_ID` — the Azure SDK reads that variable itself for workload identity and
+service-principal auth, so adopting it would hijack an already-meaningful setting.
+
+### Certificate auth needs a cargo feature
+
+`client-certificate` is the one credential that is not in the default build:
+`azure_identity`'s `client_certificate` feature links OpenSSL, which the musl image
+deliberately avoids. Build with `--features azure-client-certificate` to enable it.
+Without it, a build that finds `AZURE_CLIENT_CERTIFICATE_PATH` set says so rather than
+silently falling through to another credential.
+
+### Role assignment
+
+Every credential above needs data-plane permission — **Storage Blob Data Reader** on the
+account or container:
+
+```sh
+az role assignment create \
+  --role "Storage Blob Data Reader" \
+  --assignee <principal-id> \
+  --scope "/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Storage/storageAccounts/<account>"
+```
+
+Account-level RBAC is separate from data-plane RBAC: Owner or Contributor on the storage
+account does **not** grant blob read.
+
+Do not set `Content-Encoding` on the archive blob. Azure applies ranges to stored bytes
+regardless, but a blob-level encoding confuses CDNs and proxies in front of rati.
+
+### Testing against Azurite
+
+The emulator's well-known development account is recognised, so a local Azurite instance
+works without configuration:
+
+```sh
+azurite-blob --location ./azurite-data --blobHost 127.0.0.1 --blobPort 10000
+az storage container create --name valhalla --public-access blob
+az storage blob upload --container-name valhalla --name tiles.tar --file ./tiles.tar
+rati "http://127.0.0.1:10000/devstoreaccount1/valhalla/tiles.tar"
+```
+
+Plaintext (`http://`) endpoints are always treated as anonymous — rati will not put a
+bearer token on the wire in the clear — so the container must be public or the URL must
+carry a SAS.
+
+Note that Azure targets roughly 3,000 requests per second against a *single* block blob, and
+the partition key is account + container + blob name. With a CDN in front that ceiling is
+far away, but it is the number to watch if you serve tiles to origin directly.
+
+## Build Features
+
+| Feature | Default | Pulls in |
+|---------|---------|----------|
+| `s3` | yes | `aws-config`, `aws-sdk-s3` |
+| `azure` | yes | `azure_storage_blob`, `azure_identity` |
+| `azure-client-certificate` | no | adds OpenSSL, for service-principal certificate auth |
+
+Local archives need neither. Dropping an unused backend removes its HTTP and TLS stack:
+
+```sh
+cargo build --release --no-default-features --features azure
+```
 
 ## Endpoints
 
