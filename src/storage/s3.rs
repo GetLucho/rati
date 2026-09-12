@@ -81,6 +81,15 @@ pub(super) async fn read_s3_range(
         .await
         .map_err(|e| Error::Io(format!("reading S3 response body: {e}")))?
         .into_bytes();
+
+    // Callers index into the result assuming it is exactly `length` bytes;
+    // `scan_tar_headers` subtracts from `chunk.len()` and would underflow on a short read.
+    if data.len() as u64 != length {
+        return Err(Error::Io(format!(
+            "short read at offset={offset}: asked for {length} bytes, got {}",
+            data.len()
+        )));
+    }
     Ok(data)
 }
 

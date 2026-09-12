@@ -3,16 +3,19 @@ name = "rati"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.94"
-description = "Lightweight tile server for Valhalla graph tiles backed by S3 or a local tar archive"
+description = "Lightweight tile server for Valhalla graph tiles backed by S3, Azure Blob Storage, or a local tar archive"
 readme = "README.md"
 repository = "https://github.com/valhalla/rati"
 license = "MIT OR Apache-2.0"
 include = ["**/*.rs"]
 
 [features]
-default = ["s3"]
+default = ["s3", "azure"]
 s3 = ["dep:aws-config", "dep:aws-sdk-s3"]
-azure = []
+azure = ["dep:azure_core", "dep:azure_identity", "dep:azure_storage_blob"]
+# Service-principal certificate auth. Off by default: azure_identity's client_certificate
+# feature links OpenSSL, which the default musl image deliberately avoids.
+azure-client-certificate = ["azure", "azure_identity/client_certificate"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -24,8 +27,11 @@ lto = "thin"
 aws-config = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client", "sso"], optional = true }
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"], optional = true }
 axum = "0.8"
+azure_core = { version = "1.1.0", optional = true }
+azure_identity = { version = "1.0.0", optional = true }
+azure_storage_blob = { version = "1.1.0", optional = true }
 bytes = "1"
-clap = { version = "4.6", features = ["derive"] }
+clap = { version = "4.6", features = ["derive", "env"] }
 flate2 = "1"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 http-body = "1"

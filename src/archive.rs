@@ -286,8 +286,9 @@ impl Archive {
         source: &str,
         scan_index: bool,
         dataset_id_override: Option<&str>,
+        azure: crate::storage::AzureOptions<'_>,
     ) -> Result<(Self, ArchiveMeta), Error> {
-        let (storage, src) = Storage::open(source).await?;
+        let (storage, src) = Storage::open(source, azure).await?;
         let ArchiveSource {
             etag,
             last_modified,
