@@ -1,6 +1,9 @@
-//! Storage backends for a tar archive. Hides whether bytes come from S3 or a local
-//! file — every read goes through [`Storage::read_range`]; everything above this layer
-//! is unaware of the source.
+//! Storage backends for a tar archive. Hides whether bytes come from S3, Azure Blob,
+//! or a local file — every read goes through [`Storage::read_range`]; everything above
+//! this layer is unaware of the source.
+
+#[cfg(feature = "azure")]
+pub mod azure;
 
 use std::sync::Arc;
 
@@ -8,14 +11,36 @@ use bytes::Bytes;
 
 use crate::archive::Error;
 
+/// Strip the query string from an archive location before it is logged or put in an
+/// error.
+///
+/// An Azure Blob URL may carry a shared access signature there — `?...&sig=...` — which
+/// is a bearer credential. Anything that prints the archive location must go through
+/// this, or the token lands in stdout and every log aggregator downstream.
+///
+/// Only URLs are truncated. A filesystem path may legitimately contain a `?`, and
+/// reporting `/data/tiles` for `/data/tiles?v2.tar` names a file the operator never gave.
+pub fn redact(source: &str) -> &str {
+    if !source.starts_with("http://") && !source.starts_with("https://") {
+        return source;
+    }
+    match source.split_once('?') {
+        Some((head, _)) => head,
+        None => source,
+    }
+}
+
 /// Source metadata read once when the archive is opened.
 pub struct ArchiveSource {
-    /// Source ETag — S3 object ETag, or synthesized `"<mtime>-<size>"` for local archives.
+    /// Source ETag — the object or blob ETag, or synthesized `"<mtime>-<size>"` for
+    /// local archives.
     pub etag: Box<str>,
     /// Source Last-Modified as an HTTP-date string.
     pub last_modified: Box<str>,
     /// Total size of the archive in bytes.
     pub size: u64,
+    /// Leading bytes the backend already read while fetching metadata, if any.
+    pub prefetch: Option<Bytes>,
 }
 
 pub enum Storage {
@@ -27,6 +52,12 @@ pub enum Storage {
         /// ETag the index was built against; every read is pinned to it.
         etag: Box<str>,
     },
+    #[cfg(feature = "azure")]
+    AzureBlob {
+        client: Box<azure_storage_blob::BlobClient>,
+        /// ETag the index was built against; every read is pinned to it.
+        etag: Box<str>,
+    },
     Local {
         // `Arc<std::fs::File>` lets us call `read_at` (which takes `&self`) concurrently
         // from multiple `spawn_blocking` tasks without `try_clone()` syscalls per read.
@@ -35,8 +66,21 @@ pub enum Storage {
 }
 
 impl Storage {
-    /// Open `source`: an S3 URL (`s3://bucket/key`) or a local filesystem path.
+    /// Open `source`: an S3 URL (`s3://bucket/key`), an Azure Blob HTTPS URL, or a local
+    /// filesystem path.
     pub async fn open(source: &str) -> Result<(Self, ArchiveSource), Error> {
+        #[cfg(feature = "azure")]
+        if azure::is_azure_url(source) {
+            return azure::open_azure(source).await;
+        }
+
+        #[cfg(not(feature = "azure"))]
+        if source.starts_with("https://") || source.starts_with("http://") {
+            return Err(Error::Protocol(
+                "HTTP(S) archives require the 'azure' cargo feature".into(),
+            ));
+        }
+
         #[cfg(feature = "s3")]
         if let Some((bucket, key)) = parse_s3_url(source) {
             return open_s3(bucket, key).await;
@@ -66,6 +110,10 @@ impl Storage {
                 key,
                 etag,
             } => read_s3_range(client, bucket, key, etag, offset, length).await,
+            #[cfg(feature = "azure")]
+            Self::AzureBlob { client, etag } => {
+                azure::read_azure_range(client, etag, offset, length).await
+            }
             Self::Local { file } => read_local_range(file.clone(), offset, length).await,
         }?;
 
@@ -82,27 +130,31 @@ impl Storage {
     }
 }
 
+/// Filesystem-backed tar archive: `stat` for metadata, positional reads for ranges.
 /// Open the archive from the local filesystem. ETag is synthesized from `mtime+size`
 /// (matches a fresh value whenever the archive changes); Last-Modified is the file's
 /// mtime formatted as an HTTP-date.
 fn open_local(path: &str) -> Result<(Storage, ArchiveSource), Error> {
-    let metadata =
-        std::fs::metadata(path).map_err(|e| Error::Io(format!("stat({path}) failed: {e}")))?;
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| Error::Io(format!("stat({}) failed: {e}", redact(path))))?;
     if !metadata.is_file() {
-        return Err(Error::Protocol(format!("{path} is not a regular file")));
+        return Err(Error::Protocol(format!(
+            "{} is not a regular file",
+            redact(path)
+        )));
     }
     let size = metadata.len();
     let mtime = metadata
         .modified()
-        .map_err(|e| Error::Io(format!("{path} has no mtime: {e}")))?;
+        .map_err(|e| Error::Io(format!("{} has no mtime: {e}", redact(path))))?;
     let mtime_unix = mtime
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| Error::Protocol("file mtime is before UNIX epoch".into()))?
         .as_secs();
     let etag: Box<str> = format!("\"{mtime_unix}-{size}\"").into();
     let last_modified: Box<str> = httpdate::fmt_http_date(mtime).into();
-    let file =
-        std::fs::File::open(path).map_err(|e| Error::Io(format!("open({path}) failed: {e}")))?;
+    let file = std::fs::File::open(path)
+        .map_err(|e| Error::Io(format!("open({}) failed: {e}", redact(path))))?;
 
     Ok((
         Storage::Local {
@@ -112,6 +164,7 @@ fn open_local(path: &str) -> Result<(Storage, ArchiveSource), Error> {
             etag,
             last_modified,
             size,
+            prefetch: None,
         },
     ))
 }
@@ -139,7 +192,9 @@ async fn read_local_range(
 
 /// S3-backed tar archive: `HeadObject` for metadata, ranged `GetObject` for reads.
 #[cfg(feature = "s3")]
+#[cfg(feature = "s3")]
 /// Split an `s3://bucket/key` URL into its bucket and key.
+#[cfg(feature = "s3")]
 fn parse_s3_url(url: &str) -> Option<(&str, &str)> {
     let path = url.strip_prefix("s3://")?;
     path.split_once('/')
@@ -148,6 +203,7 @@ fn parse_s3_url(url: &str) -> Option<(&str, &str)> {
 #[cfg(feature = "s3")]
 /// Open the archive from S3: HeadObject for ETag/Last-Modified/size, then hand back the
 /// pieces `Archive::open` needs to read the rest.
+#[cfg(feature = "s3")]
 async fn open_s3(bucket: &str, key: &str) -> Result<(Storage, ArchiveSource), Error> {
     let client = aws_sdk_s3::Client::new(
         &aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await,
@@ -191,6 +247,7 @@ async fn open_s3(bucket: &str, key: &str) -> Result<(Storage, ArchiveSource), Er
             etag,
             last_modified,
             size,
+            prefetch: None,
         },
     ))
 }
@@ -251,6 +308,33 @@ async fn read_s3_range(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_strips_the_query_string() {
+        // A SAS is a bearer credential and must never reach a log or an error.
+        assert_eq!(
+            redact("https://acct.blob.core.windows.net/t/p.tar?sv=2024-11-04&sig=SECRET"),
+            "https://acct.blob.core.windows.net/t/p.tar"
+        );
+        // Nothing to strip: left exactly as-is, including for the other backends.
+        assert_eq!(
+            redact("https://acct.blob.core.windows.net/t/p.tar"),
+            "https://acct.blob.core.windows.net/t/p.tar"
+        );
+        assert_eq!(redact("s3://bucket/planet.tar"), "s3://bucket/planet.tar");
+        assert_eq!(redact("/data/planet.tar"), "/data/planet.tar");
+        // A bare "?" still loses everything after it.
+        assert_eq!(redact("https://h/p.tar?"), "https://h/p.tar");
+    }
+
+    #[test]
+    fn redact_leaves_filesystem_paths_alone() {
+        // A path may legitimately contain '?'; truncating it would name a file the
+        // operator never passed.
+        assert_eq!(redact("/data/tiles?v2.tar"), "/data/tiles?v2.tar");
+        assert_eq!(redact("./tiles?x.tar"), "./tiles?x.tar");
+        assert_eq!(redact("s3://bucket/planet.tar"), "s3://bucket/planet.tar");
+    }
 
     /// The exact-length contract every caller relies on: `scan_tar_headers` computes
     /// `chunk.len() - local`, which underflows on a short read.

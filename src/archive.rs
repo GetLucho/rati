@@ -272,8 +272,8 @@ pub struct Archive {
 impl Archive {
     /// Connect to the archive and load the tar index.
     ///
-    /// `source` is either an S3 URL (`s3://bucket/key`) or a local filesystem path.
-    /// For S3, uses the default AWS credential chain (SSO, IRSA, env vars, IMDS).
+    /// `source` is an S3 URL (`s3://bucket/key`), an Azure Blob HTTPS URL, or a local
+    /// filesystem path — see [`crate::storage`] for how each is opened and authenticated.
     ///
     /// If the first tar entry is not `index.bin` and `scan_index` is true, falls back
     /// to scanning tar headers to build the index — slow for large archives, since tar
@@ -292,10 +292,15 @@ impl Archive {
             etag,
             last_modified,
             size: archive_size,
+            prefetch,
         } = src;
 
-        // Step 1: Read the first 512-byte tar header
-        let header_bytes = storage.read_range(0, TAR_BLOCK_SIZE as u64).await?;
+        // Step 1: the first 512-byte tar header, reusing it if the backend already
+        // read it while fetching metadata.
+        let header_bytes = match prefetch {
+            Some(bytes) if bytes.len() >= TAR_BLOCK_SIZE => bytes.slice(0..TAR_BLOCK_SIZE),
+            _ => storage.read_range(0, TAR_BLOCK_SIZE as u64).await?,
+        };
         let header: &[u8; TAR_BLOCK_SIZE] = header_bytes
             .as_ref()
             .try_into()
