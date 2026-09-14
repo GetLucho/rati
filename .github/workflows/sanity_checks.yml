@@ -6,6 +6,16 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every combination that ships: the backend on, and off.
+        features:
+          - ""
+          - "--no-default-features"
+
+    name: ${{ matrix.features || 'default features' }}
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -20,7 +30,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run Clippy
-        run: cargo clippy -- -Dwarnings
+        run: cargo clippy --all-targets ${{ matrix.features }} -- -Dwarnings
 
       - name: Run tests
-        run: cargo test
+        run: cargo test ${{ matrix.features }}

@@ -19,6 +19,7 @@ pub struct ArchiveSource {
 }
 
 pub enum Storage {
+    #[cfg(feature = "s3")]
     S3 {
         client: aws_sdk_s3::Client,
         bucket: Box<str>,
@@ -34,8 +35,16 @@ pub enum Storage {
 impl Storage {
     /// Open `source`: an S3 URL (`s3://bucket/key`) or a local filesystem path.
     pub async fn open(source: &str) -> Result<(Self, ArchiveSource), Error> {
+        #[cfg(feature = "s3")]
         if let Some((bucket, key)) = s3::parse_s3_url(source) {
             return s3::open_s3(bucket, key).await;
+        }
+
+        #[cfg(not(feature = "s3"))]
+        if source.starts_with("s3://") {
+            return Err(Error::Protocol(
+                "S3 archives require the 's3' cargo feature".into(),
+            ));
         }
 
         local::open_local(source)
@@ -48,6 +57,7 @@ impl Storage {
         }
 
         let data = match self {
+            #[cfg(feature = "s3")]
             Self::S3 {
                 client,
                 bucket,
@@ -135,6 +145,7 @@ mod local {
 }
 
 /// S3-backed tar archive: `HeadObject` for metadata, ranged `GetObject` for reads.
+#[cfg(feature = "s3")]
 mod s3 {
     use bytes::Bytes;
 
