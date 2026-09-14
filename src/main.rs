@@ -18,6 +18,7 @@ use tokio::signal;
 use tracing::info;
 
 mod archive;
+mod storage;
 
 use archive::TileCompression;
 
