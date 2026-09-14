@@ -47,14 +47,25 @@ impl Storage {
             return Ok(Bytes::new());
         }
 
-        match self {
+        let data = match self {
             Self::S3 {
                 client,
                 bucket,
                 key,
             } => s3::read_s3_range(client, bucket, key, offset, length).await,
             Self::Local { file } => local::read_local_range(file.clone(), offset, length).await,
+        }?;
+
+        // Callers index into the result assuming it is exactly `length` bytes;
+        // `scan_tar_headers` subtracts from `chunk.len()` and would underflow on a short
+        // read. A ranged GET may return less, so enforce it here once for every backend.
+        if data.len() as u64 != length {
+            return Err(Error::Io(format!(
+                "short read at offset={offset}: asked for {length} bytes, got {}",
+                data.len()
+            )));
         }
+        Ok(data)
     }
 }
 
