@@ -1,6 +1,6 @@
 # Rati
 
-Rati (Range-Accessed Tar Index) is a lightweight HTTP server that serves individual [Valhalla](https://github.com/valhalla/valhalla) tiles from tar archives — stored on S3 or on the local filesystem — via byte-range reads.
+Rati (Range-Accessed Tar Index) is a lightweight HTTP server that serves individual [Valhalla](https://github.com/valhalla/valhalla) tiles from tar archives — stored on S3, Azure Blob Storage, or on the local filesystem — via byte-range reads.
 Named after the auger Odin used to bore through a mountain to reach the mead of poetry locked within.
 
 Rati was created with two use cases in mind:
@@ -15,7 +15,9 @@ rati <archive> [OPTIONS]
 ```
 
 **Arguments:**
-- `<archive>` — Archive location. Either an S3 URL (`s3://bucket/path/to/tiles.tar`) or a path to a local `.tar` file. Anything not starting with `s3://` is treated as a local path.
+- `<archive>` — Archive location. An S3 URL (`s3://bucket/path/to/tiles.tar`), an Azure Blob
+  URL (`https://<account>.blob.core.windows.net/<container>/tiles.tar`), or a path to a local
+  `.tar` file. Anything else is treated as a local path.
 
 **Options:**
 | Flag | Default | Description |
@@ -25,6 +27,8 @@ rati <archive> [OPTIONS]
 | `--cache-max-age <SECONDS>` | `86400` | `Cache-Control` max-age in seconds |
 | `--port <PORT>` | `3000` | Port to listen on |
 | `--concurrency <N>` | `4` | Max worker threads |
+| `--azure-credential <KIND>` | auto-detect | Force a credential: `anonymous`, `workload-identity`, `client-secret`, `managed-identity`, `developer-tools` |
+| `--azure-user-assigned-id <ID>` | none | Client id of a user-assigned managed identity (env: `RATI_AZURE_USER_ASSIGNED_ID`) |
 
 ### Example with Valhalla
 
@@ -45,6 +49,63 @@ rati ./tiles.tar --port 8080
 ```
 
 See [`valhalla_build_config`](https://github.com/valhalla/valhalla/blob/master/scripts/valhalla_build_config) for the full list of flags.
+
+### Azure Blob Storage
+
+```sh
+rati "https://myaccount.blob.core.windows.net/valhalla/tiles.tar" --port 8080
+```
+
+Credentials are resolved in this order. The first row whose condition holds wins;
+`--azure-credential <kind>` skips detection entirely.
+
+| # | Condition | Credential | `--azure-credential` |
+|---|-----------|------------|----------------------|
+| 1 | URL is `http://`, or carries a SAS (`?...&sig=...`) | none | `anonymous` |
+| 2 | `AZURE_FEDERATED_TOKEN_FILE` | Workload Identity (AKS) | `workload-identity` |
+| 3 | `AZURE_TENANT_ID` + `AZURE_CLIENT_ID` + `AZURE_CLIENT_SECRET` | service principal, secret | `client-secret` |
+| 4 | `IDENTITY_ENDPOINT` or `MSI_ENDPOINT` | managed identity | `managed-identity` |
+| 5 | otherwise | Azure CLI / Azure Developer CLI | `developer-tools` |
+
+Two cases detection cannot see, which is what `--azure-credential` is for: a plain Azure VM
+or VMSS exposes no marker at all (IMDS is reachable but invisible), and a container image
+without the Azure CLI falls through to row 5 and fails looking for `az`.
+
+For a user-assigned managed identity, pass its client id:
+
+```sh
+rati "https://myaccount.blob.core.windows.net/valhalla/tiles.tar" \
+  --azure-credential managed-identity \
+  --azure-user-assigned-id <client-id>
+```
+
+That flag reads `RATI_AZURE_USER_ASSIGNED_ID`, deliberately *not* `AZURE_CLIENT_ID` — the
+Azure SDK reads that variable itself for workload identity and service-principal auth, so
+adopting it would hijack an already-meaningful setting.
+
+Whichever credential is used needs **Storage Blob Data Reader** on the account or container.
+
+Two rati-specific notes:
+
+- Plaintext (`http://`) endpoints are always treated as anonymous — rati will not put a
+  bearer token on the wire in the clear — so the container must be public or the URL must
+  carry a SAS. The emulator's well-known `devstoreaccount1` account is recognised, so a local
+  Azurite instance works with no configuration.
+- Do not set `Content-Encoding` on the archive blob. Azure applies ranges to stored bytes
+  regardless, but a blob-level encoding confuses CDNs and proxies in front of rati.
+
+## Build Features
+
+| Feature | Default | Pulls in |
+|---------|---------|----------|
+| `s3` | yes | `aws-config`, `aws-sdk-s3` |
+| `azure` | yes | `azure_storage_blob`, `azure_identity` |
+
+Local archives need neither. Dropping an unused backend removes its HTTP and TLS stack:
+
+```sh
+cargo build --release --no-default-features --features azure
+```
 
 ## Endpoints
 
@@ -90,8 +151,8 @@ Every tile response includes headers suitable for CDN caching:
 
 | Header | Description |
 |--------|-------------|
-| `ETag` | S3 object ETag, or synthesized `"<mtime>-<size>"` for local archives — both change whenever the archive is replaced |
-| `Last-Modified` | S3 object last-modified timestamp, or the file's mtime for local archives |
+| `ETag` | The object or blob ETag, or synthesized `"<mtime>-<size>"` for local archives — all change whenever the archive is replaced |
+| `Last-Modified` | The object or blob last-modified timestamp, or the file's mtime for local archives |
 | `Cache-Control` | `public, max-age=<n>, immutable` — `<n>` from `--cache-max-age` (default 86400) |
 | `X-Dataset-Id` | Auto-detected from `GraphTileHeader`, overridden with `--dataset-id`, or the ETag as fallback |
 | `Vary` | `Accept-Encoding` — ensures correct CDN behavior with encoding negotiation |
@@ -101,7 +162,7 @@ Every tile response includes headers suitable for CDN caching:
 
 For graph tile archives (`.gph`), the dataset ID is automatically extracted from the `GraphTileHeader` of the first tile in the archive. This is typically the OSM changeset ID (`dataset_id_` field, a `u64` at byte offset 32 in the 272-byte header).
 
-For any other kind of archive, use `--dataset-id` to provide an explicit value. If neither works, the S3 ETag is used as a fallback.
+For any other kind of archive, use `--dataset-id` to provide an explicit value. If neither works, the archive ETag is used as a fallback.
 
 ## Index Modes
 

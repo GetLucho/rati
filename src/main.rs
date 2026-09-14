@@ -24,7 +24,7 @@ use archive::TileCompression;
 
 #[derive(Parser)]
 struct Config {
-    /// Archive location: `s3://bucket/key.tar` or a local filesystem path
+    /// Archive location: `s3://bucket/key.tar`, an Azure Blob HTTPS URL, or a local path
     archive: String,
     /// Build index by scanning tar headers if index.bin is missing
     #[arg(long)]
@@ -41,6 +41,37 @@ struct Config {
     /// Max threads to use
     #[arg(long, default_value_t = NonZero::new(4).unwrap())]
     concurrency: NonZero<u16>,
+    /// Client ID of a user-assigned managed identity for Azure Blob archives
+    ///
+    /// Deliberately not bound to AZURE_CLIENT_ID: the Azure SDK reads that
+    /// variable itself for workload identity and service-principal auth, so
+    /// adopting it here would hijack an already-meaningful setting.
+    #[cfg(feature = "azure")]
+    #[arg(long, env = "RATI_AZURE_USER_ASSIGNED_ID")]
+    azure_user_assigned_id: Option<String>,
+    /// Force an Azure credential instead of detecting one from the environment.
+    ///
+    /// A plain Azure VM or VMSS exposes no environment marker, so reaching IMDS
+    /// there needs `managed-identity` named explicitly.
+    #[cfg(feature = "azure")]
+    #[arg(long, value_enum)]
+    azure_credential: Option<storage::CredentialKind>,
+}
+
+impl Config {
+    /// Azure knobs gathered in one place, so the call site needs no `#[cfg]`.
+    #[cfg(feature = "azure")]
+    fn azure_options(&self) -> storage::AzureOptions<'_> {
+        storage::AzureOptions {
+            user_assigned: self.azure_user_assigned_id.as_deref(),
+            credential: self.azure_credential,
+        }
+    }
+
+    #[cfg(not(feature = "azure"))]
+    fn azure_options(&self) -> storage::AzureOptions<'_> {
+        storage::AzureOptions::default()
+    }
 }
 
 #[derive(Clone)]
@@ -73,12 +104,15 @@ async fn run(config: Config) {
         &config.archive,
         config.scan_index,
         config.dataset_id.as_deref(),
+        config.azure_options(),
     )
     .await
     .expect("failed to load tar index");
     info!(
         "Loaded {} with {} tiles (dataset_id={})",
-        config.archive, meta.tile_count, meta.dataset_id,
+        storage::redact(&config.archive),
+        meta.tile_count,
+        meta.dataset_id,
     );
 
     let cache_headers = build_cache_headers(&meta, config.cache_max_age);

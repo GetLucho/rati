@@ -1,6 +1,9 @@
-//! Storage backends for a tar archive. Hides whether bytes come from S3 or a local
-//! file — every read goes through [`Storage::read_range`]; everything above this layer
-//! is unaware of the source.
+//! Storage backends for a tar archive. Hides whether bytes come from S3, Azure Blob,
+//! or a local file — every read goes through [`Storage::read_range`]; everything above
+//! this layer is unaware of the source.
+
+#[cfg(feature = "azure")]
+pub mod azure;
 
 use std::sync::Arc;
 
@@ -8,14 +11,60 @@ use bytes::Bytes;
 
 use crate::archive::Error;
 
+/// Which credential rati should present to Azure Blob.
+///
+/// Lives here rather than in [`azure`] so the command line can name one without the
+/// `azure` feature leaking upward, and so `AzureOptions` needs no feature gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum CredentialKind {
+    /// No credential: a SAS in the URL, a public container, or a plaintext endpoint.
+    Anonymous,
+    /// Entra Workload ID — an AKS pod with a projected federated token.
+    WorkloadIdentity,
+    /// A service principal holding a secret — the usual CI credential.
+    ClientSecret,
+    /// A managed identity: Container Apps, App Service, Arc, Cloud Shell, or IMDS
+    /// on a plain VM or VMSS.
+    ManagedIdentity,
+    /// Local development; chains the az and azd CLIs.
+    DeveloperTools,
+}
+
+/// Azure-specific knobs, threaded through from the command line. Inert for the
+/// other backends, and for every backend when the `azure` feature is off.
+#[derive(Debug, Default, Clone, Copy)]
+#[cfg_attr(not(feature = "azure"), allow(dead_code))]
+pub struct AzureOptions<'a> {
+    /// Client id of a user-assigned managed identity.
+    pub user_assigned: Option<&'a str>,
+    /// Force a credential instead of detecting one from the environment.
+    pub credential: Option<CredentialKind>,
+}
+
+/// Strip the query string from an archive location before it is logged or put in an
+/// error.
+///
+/// An Azure Blob URL may carry a shared access signature there — `?...&sig=...` — which
+/// is a bearer credential. Anything that prints the archive location must go through
+/// this, or the token lands in stdout and every log aggregator downstream.
+pub fn redact(source: &str) -> &str {
+    match source.split_once('?') {
+        Some((head, _)) => head,
+        None => source,
+    }
+}
+
 /// Source metadata read once when the archive is opened.
 pub struct ArchiveSource {
-    /// Source ETag — S3 object ETag, or synthesized `"<mtime>-<size>"` for local archives.
+    /// Source ETag — the object or blob ETag, or synthesized `"<mtime>-<size>"` for
+    /// local archives.
     pub etag: Box<str>,
     /// Source Last-Modified as an HTTP-date string.
     pub last_modified: Box<str>,
     /// Total size of the archive in bytes.
     pub size: u64,
+    /// Leading bytes the backend already read while fetching metadata, if any.
+    pub prefetch: Option<Bytes>,
 }
 
 pub enum Storage {
@@ -25,6 +74,12 @@ pub enum Storage {
         bucket: Box<str>,
         key: Box<str>,
     },
+    #[cfg(feature = "azure")]
+    AzureBlob {
+        client: Box<azure_storage_blob::BlobClient>,
+        /// ETag the index was built against; every read is pinned to it.
+        etag: Box<str>,
+    },
     Local {
         // `Arc<std::fs::File>` lets us call `read_at` (which takes `&self`) concurrently
         // from multiple `spawn_blocking` tasks without `try_clone()` syscalls per read.
@@ -33,8 +88,32 @@ pub enum Storage {
 }
 
 impl Storage {
-    /// Open `source`: an S3 URL (`s3://bucket/key`) or a local filesystem path.
-    pub async fn open(source: &str) -> Result<(Self, ArchiveSource), Error> {
+    /// Open `source`: an S3 URL (`s3://bucket/key`), an Azure Blob HTTPS URL, or a local
+    /// filesystem path.
+    pub async fn open(
+        source: &str,
+        #[allow(unused_variables)] opts: AzureOptions<'_>,
+    ) -> Result<(Self, ArchiveSource), Error> {
+        #[cfg(feature = "azure")]
+        if azure::is_azure_url(source) {
+            return azure::open_azure(source, opts.user_assigned, opts.credential).await;
+        }
+
+        #[cfg(feature = "azure")]
+        if source.starts_with("https://") || source.starts_with("http://") {
+            return Err(Error::Protocol(format!(
+                "{} is not an Azure Blob endpoint; expected \
+                 https://<account>.blob.core.windows.net/<container>/<blob>.tar",
+                redact(source)
+            )));
+        }
+        #[cfg(not(feature = "azure"))]
+        if source.starts_with("https://") || source.starts_with("http://") {
+            return Err(Error::Protocol(
+                "HTTP(S) archives require the 'azure' cargo feature".into(),
+            ));
+        }
+
         #[cfg(feature = "s3")]
         if let Some((bucket, key)) = s3::parse_s3_url(source) {
             return s3::open_s3(bucket, key).await;
@@ -63,6 +142,10 @@ impl Storage {
                 bucket,
                 key,
             } => s3::read_s3_range(client, bucket, key, offset, length).await,
+            #[cfg(feature = "azure")]
+            Self::AzureBlob { client, etag } => {
+                azure::read_azure_range(client, etag, offset, length).await
+            }
             Self::Local { file } => local::read_local_range(file.clone(), offset, length).await,
         }?;
 
@@ -85,22 +168,25 @@ mod local {
 
     use bytes::Bytes;
 
-    use super::{ArchiveSource, Storage};
+    use super::{ArchiveSource, Storage, redact};
     use crate::archive::Error;
 
     /// Open the archive from the local filesystem. ETag is synthesized from `mtime+size`
     /// (matches a fresh value whenever the archive changes); Last-Modified is the file's
     /// mtime formatted as an HTTP-date.
     pub(super) fn open_local(path: &str) -> Result<(Storage, ArchiveSource), Error> {
-        let metadata =
-            std::fs::metadata(path).map_err(|e| Error::Io(format!("stat({path}) failed: {e}")))?;
+        let metadata = std::fs::metadata(path)
+            .map_err(|e| Error::Io(format!("stat({}) failed: {e}", redact(path))))?;
         if !metadata.is_file() {
-            return Err(Error::Protocol(format!("{path} is not a regular file")));
+            return Err(Error::Protocol(format!(
+                "{} is not a regular file",
+                redact(path)
+            )));
         }
         let size = metadata.len();
         let mtime = metadata
             .modified()
-            .map_err(|e| Error::Io(format!("{path} has no mtime: {e}")))?;
+            .map_err(|e| Error::Io(format!("{} has no mtime: {e}", redact(path))))?;
         let mtime_unix = mtime
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|_| Error::Protocol("file mtime is before UNIX epoch".into()))?
@@ -108,7 +194,7 @@ mod local {
         let etag: Box<str> = format!("\"{mtime_unix}-{size}\"").into();
         let last_modified: Box<str> = httpdate::fmt_http_date(mtime).into();
         let file = std::fs::File::open(path)
-            .map_err(|e| Error::Io(format!("open({path}) failed: {e}")))?;
+            .map_err(|e| Error::Io(format!("open({}) failed: {e}", redact(path))))?;
 
         Ok((
             Storage::Local {
@@ -118,6 +204,7 @@ mod local {
                 etag,
                 last_modified,
                 size,
+                prefetch: None,
             },
         ))
     }
@@ -205,6 +292,7 @@ mod s3 {
                 etag,
                 last_modified,
                 size,
+                prefetch: None,
             },
         ))
     }
@@ -231,7 +319,6 @@ mod s3 {
             .await
             .map_err(|e| Error::Io(format!("reading S3 response body: {e}")))?
             .into_bytes();
-
         Ok(data)
     }
 
@@ -256,5 +343,28 @@ mod s3 {
             assert_eq!(parse_s3_url("s3://bucket-only"), None);
             assert_eq!(parse_s3_url("s3://file-only.tar"), None);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redact_strips_the_query_string() {
+        // A SAS is a bearer credential and must never reach a log or an error.
+        assert_eq!(
+            redact("https://acct.blob.core.windows.net/t/p.tar?sv=2024-11-04&sig=SECRET"),
+            "https://acct.blob.core.windows.net/t/p.tar"
+        );
+        // Nothing to strip: left exactly as-is, including for the other backends.
+        assert_eq!(
+            redact("https://acct.blob.core.windows.net/t/p.tar"),
+            "https://acct.blob.core.windows.net/t/p.tar"
+        );
+        assert_eq!(redact("s3://bucket/planet.tar"), "s3://bucket/planet.tar");
+        assert_eq!(redact("/data/planet.tar"), "/data/planet.tar");
+        // A bare "?" still loses everything after it.
+        assert_eq!(redact("https://h/p.tar?"), "https://h/p.tar");
     }
 }

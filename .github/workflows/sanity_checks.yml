@@ -9,10 +9,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Every combination that ships: the backend on, and off.
+        # Every combination that ships: both backends, neither, and each alone.
         features:
           - ""
           - "--no-default-features"
+          - "--no-default-features --features s3"
+          - "--no-default-features --features azure"
 
     name: ${{ matrix.features || 'default features' }}
 
