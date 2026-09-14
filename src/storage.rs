@@ -19,6 +19,7 @@ pub struct ArchiveSource {
 }
 
 pub enum Storage {
+    #[cfg(feature = "s3")]
     S3 {
         client: aws_sdk_s3::Client,
         bucket: Box<str>,
@@ -36,8 +37,16 @@ pub enum Storage {
 impl Storage {
     /// Open `source`: an S3 URL (`s3://bucket/key`) or a local filesystem path.
     pub async fn open(source: &str) -> Result<(Self, ArchiveSource), Error> {
+        #[cfg(feature = "s3")]
         if let Some((bucket, key)) = parse_s3_url(source) {
             return open_s3(bucket, key).await;
+        }
+
+        #[cfg(not(feature = "s3"))]
+        if source.starts_with("s3://") {
+            return Err(Error::Protocol(
+                "S3 archives require the 's3' cargo feature".into(),
+            ));
         }
 
         open_local(source)
@@ -50,6 +59,7 @@ impl Storage {
         }
 
         let data = match self {
+            #[cfg(feature = "s3")]
             Self::S3 {
                 client,
                 bucket,
@@ -128,12 +138,14 @@ async fn read_local_range(
 }
 
 /// S3-backed tar archive: `HeadObject` for metadata, ranged `GetObject` for reads.
+#[cfg(feature = "s3")]
 /// Split an `s3://bucket/key` URL into its bucket and key.
 fn parse_s3_url(url: &str) -> Option<(&str, &str)> {
     let path = url.strip_prefix("s3://")?;
     path.split_once('/')
 }
 
+#[cfg(feature = "s3")]
 /// Open the archive from S3: HeadObject for ETag/Last-Modified/size, then hand back the
 /// pieces `Archive::open` needs to read the rest.
 async fn open_s3(bucket: &str, key: &str) -> Result<(Storage, ArchiveSource), Error> {
@@ -183,6 +195,7 @@ async fn open_s3(bucket: &str, key: &str) -> Result<(Storage, ArchiveSource), Er
     ))
 }
 
+#[cfg(feature = "s3")]
 /// The `GetObject` request for one ranged read, pinned to `etag`.
 fn ranged_read(
     client: &aws_sdk_s3::Client,
@@ -200,6 +213,7 @@ fn ranged_read(
         .if_match(etag)
 }
 
+#[cfg(feature = "s3")]
 /// Read `length` bytes at `offset` from the object.
 ///
 /// Every read is conditional on the ETag captured when the archive was opened. The tile
@@ -265,6 +279,7 @@ mod tests {
     /// Every ranged read must be pinned to the ETag captured at open. Without it an
     /// object replaced mid-flight is served at stale offsets under the old ETag and
     /// `Cache-Control: immutable`, poisoning client and CDN caches.
+    #[cfg(feature = "s3")]
     #[test]
     fn every_ranged_read_is_pinned_to_the_etag() {
         let client = aws_sdk_s3::Client::from_conf(
@@ -293,6 +308,7 @@ mod tests {
         assert_eq!(req.get_range().as_deref(), Some("bytes=1536-44505535"));
     }
 
+    #[cfg(feature = "s3")]
     #[test]
     fn parse_s3_url_test() {
         assert_eq!(

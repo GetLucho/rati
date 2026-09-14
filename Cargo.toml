@@ -9,6 +9,10 @@ repository = "https://github.com/valhalla/rati"
 license = "MIT OR Apache-2.0"
 include = ["**/*.rs"]
 
+[features]
+default = ["s3"]
+s3 = ["dep:aws-config", "dep:aws-sdk-s3"]
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [profile.release]
@@ -16,8 +20,8 @@ strip = true
 lto = "thin"
 
 [dependencies]
-aws-config = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client", "sso"] }
-aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"] }
+aws-config = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client", "sso"], optional = true }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"], optional = true }
 axum = "0.8"
 bytes = "1"
 clap = { version = "4.6", features = ["derive"] }
