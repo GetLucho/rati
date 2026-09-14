@@ -47,14 +47,25 @@ impl Storage {
             return Ok(Bytes::new());
         }
 
-        match self {
+        let data = match self {
             Self::S3 {
                 client,
                 bucket,
                 key,
             } => read_s3_range(client, bucket, key, offset, length).await,
             Self::Local { file } => read_local_range(file.clone(), offset, length).await,
+        }?;
+
+        // Callers index into the result assuming it is exactly `length` bytes;
+        // `scan_tar_headers` subtracts from `chunk.len()` and would underflow on a short
+        // read. A ranged GET may return less, so enforce it here once for every backend.
+        if data.len() as u64 != length {
+            return Err(Error::Io(format!(
+                "short read at offset={offset}: asked for {length} bytes, got {}",
+                data.len()
+            )));
         }
+        Ok(data)
     }
 }
 
@@ -204,6 +215,30 @@ async fn read_s3_range(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The exact-length contract every caller relies on: `scan_tar_headers` computes
+    /// `chunk.len() - local`, which underflows on a short read.
+    #[tokio::test]
+    async fn a_short_read_is_rejected() {
+        let dir = std::env::temp_dir().join(format!("rati-short-read-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tiny.tar");
+        std::fs::write(&path, b"0123456789").unwrap();
+
+        let (storage, _) = Storage::open(path.to_str().unwrap()).await.unwrap();
+
+        // Fully satisfiable reads are returned verbatim.
+        assert_eq!(storage.read_range(0, 4).await.unwrap().as_ref(), b"0123");
+        // A zero-length read never reaches a backend.
+        assert!(storage.read_range(4, 0).await.unwrap().is_empty());
+
+        // Asking past the end must fail loudly rather than hand back a short buffer.
+        let err = storage.read_range(6, 8).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("offset=6"), "unexpected error: {msg}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn parse_s3_url_test() {
