@@ -23,6 +23,8 @@ pub enum Storage {
         client: aws_sdk_s3::Client,
         bucket: Box<str>,
         key: Box<str>,
+        /// ETag the index was built against; every read is pinned to it.
+        etag: Box<str>,
     },
     Local {
         // `Arc<std::fs::File>` lets us call `read_at` (which takes `&self`) concurrently
@@ -52,7 +54,8 @@ impl Storage {
                 client,
                 bucket,
                 key,
-            } => read_s3_range(client, bucket, key, offset, length).await,
+                etag,
+            } => read_s3_range(client, bucket, key, etag, offset, length).await,
             Self::Local { file } => read_local_range(file.clone(), offset, length).await,
         }?;
 
@@ -170,6 +173,7 @@ async fn open_s3(bucket: &str, key: &str) -> Result<(Storage, ArchiveSource), Er
             client,
             bucket: bucket.into(),
             key: key.into(),
+            etag: etag.clone(),
         },
         ArchiveSource {
             etag,
@@ -177,6 +181,23 @@ async fn open_s3(bucket: &str, key: &str) -> Result<(Storage, ArchiveSource), Er
             size,
         },
     ))
+}
+
+/// The `GetObject` request for one ranged read, pinned to `etag`.
+fn ranged_read(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    etag: &str,
+    offset: u64,
+    length: u64,
+) -> aws_sdk_s3::operation::get_object::builders::GetObjectFluentBuilder {
+    client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .range(format!("bytes={}-{}", offset, offset + length - 1))
+        .if_match(etag)
 }
 
 /// Read `length` bytes at `offset` from the object.
@@ -191,18 +212,19 @@ async fn read_s3_range(
     client: &aws_sdk_s3::Client,
     bucket: &str,
     key: &str,
+    etag: &str,
     offset: u64,
     length: u64,
 ) -> Result<Bytes, Error> {
-    let range = format!("bytes={}-{}", offset, offset + length - 1);
-    let resp = client
-        .get_object()
-        .bucket(bucket)
-        .key(key)
-        .range(&range)
+    let resp = ranged_read(client, bucket, key, etag, offset, length)
         .send()
         .await
-        .map_err(|e| Error::Io(format!("S3 GetObject failed: {e}")))?;
+        .map_err(|e| {
+            Error::Io(format!(
+                "S3 GetObject failed: {e} (a 412 here means the archive was replaced \
+                 while rati was running; restart it)"
+            ))
+        })?;
     let data = resp
         .body
         .collect()
@@ -238,6 +260,37 @@ mod tests {
         assert!(msg.contains("offset=6"), "unexpected error: {msg}");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Every ranged read must be pinned to the ETag captured at open. Without it an
+    /// object replaced mid-flight is served at stale offsets under the old ETag and
+    /// `Cache-Control: immutable`, poisoning client and CDN caches.
+    #[test]
+    fn every_ranged_read_is_pinned_to_the_etag() {
+        let client = aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::Config::builder()
+                .behavior_version_latest()
+                .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                    "id", "secret", None, None, "test",
+                ))
+                .build(),
+        );
+
+        let req = ranged_read(
+            &client,
+            "bucket",
+            "planet.tar",
+            "\"abc123\"",
+            1536,
+            44_504_000,
+        );
+        assert_eq!(
+            req.get_if_match().as_deref(),
+            Some("\"abc123\""),
+            "ranged reads must carry If-Match"
+        );
+        assert_eq!(req.get_range().as_deref(), Some("bytes=1536-44505535"));
     }
 
     #[test]
