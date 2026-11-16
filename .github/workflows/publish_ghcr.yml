@@ -23,6 +23,8 @@ jobs:
       result: ${{ steps.probe.outcome }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: 2e7ce7837fc0cabc6ca3d963a7dc0c5f92a67e9a
       - uses: docker/setup-buildx-action@v3
       - id: probe
         continue-on-error: true
@@ -41,6 +43,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: 2e7ce7837fc0cabc6ca3d963a7dc0c5f92a67e9a
 
       # Build deps for aws-lc-sys on musl. Upstream ships this line commented out.
       - name: Enable the build toolchain in the builder stage
@@ -65,7 +69,10 @@ jobs:
           push: true
           tags: |
             ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:2e7ce7837fc0cabc6ca3d963a7dc0c5f92a67e9a
+          labels: |
+            org.opencontainers.image.source=https://github.com/GetLucho/rati
+            org.opencontainers.image.revision=2e7ce7837fc0cabc6ca3d963a7dc0c5f92a67e9a
           cache-from: type=gha,scope=amd64
           cache-to: type=gha,mode=max,scope=amd64
 
